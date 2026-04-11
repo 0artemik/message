@@ -1,0 +1,193 @@
+.settings-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.35);
+  z-index: 100;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+}
+
+.settings-panel {
+  width: 100%;
+  max-width: 400px;
+  background: var(--tg-bg);
+  color: var(--tg-text);
+  border-radius: 14px;
+  box-shadow: 0 16px 48px rgba(0, 0, 0, 0.2);
+  border: 1px solid var(--tg-border);
+  overflow: hidden;
+}
+
+.settings-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 14px 16px;
+  border-bottom: 1px solid var(--tg-border);
+  background: var(--tg-header);
+}
+
+.settings-title {
+  margin: 0;
+  font-size: 18px;
+  font-weight: 600;
+}
+
+.settings-close {
+  width: 36px;
+  height: 36px;
+  border: none;
+  border-radius: 50%;
+  background: transparent;
+  font-size: 26px;
+  line-height: 1;
+  color: var(--tg-text-secondary);
+}
+
+.settings-close:hover {
+  background: var(--tg-search-bg);
+}
+
+.settings-body {
+  padding: 16px;
+}
+
+.settings-tabs {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 14px;
+}
+
+.settings-tabs button {
+  flex: 1;
+  border: 1px solid var(--tg-border);
+  border-radius: 10px;
+  padding: 8px 10px;
+  font-size: 13px;
+  font-weight: 600;
+  background: var(--tg-search-bg);
+  color: var(--tg-text);
+}
+
+.settings-tabs button.active {
+  background: var(--tg-blue);
+  border-color: var(--tg-blue);
+  color: #fff;
+}
+
+.settings-row {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.settings-label {
+  font-weight: 500;
+  font-size: 15px;
+}
+
+.settings-hint {
+  font-size: 13px;
+  color: var(--tg-text-secondary);
+  margin-top: 4px;
+}
+
+.settings-form {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.settings-input {
+  border: 1px solid var(--tg-border);
+  border-radius: 10px;
+  padding: 10px 12px;
+  background: var(--tg-search-bg);
+  color: var(--tg-text);
+}
+
+.settings-primary-btn {
+  border: 1px solid var(--tg-blue);
+  border-radius: 10px;
+  padding: 10px 12px;
+  background: var(--tg-blue);
+  color: #fff;
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.settings-primary-btn:disabled {
+  opacity: 0.65;
+}
+
+.settings-danger-btn {
+  background: #c62828;
+  border-color: #c62828;
+}
+
+.settings-error {
+  color: #c62828;
+  font-size: 13px;
+}
+
+.settings-success {
+  color: #2e7d32;
+  font-size: 13px;
+}
+
+.settings-sessions {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.settings-session-card {
+  border: 1px solid var(--tg-border);
+  border-radius: 10px;
+  padding: 10px;
+  background: var(--tg-search-bg);
+}
+
+.settings-session-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.settings-current-pill {
+  border-radius: 999px;
+  padding: 2px 8px;
+  background: rgba(51, 144, 236, 0.16);
+  color: var(--tg-blue);
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.settings-segment {
+  display: flex;
+  gap: 8px;
+}
+
+.settings-segment button {
+  flex: 1;
+  border: 1px solid var(--tg-border);
+  border-radius: 10px;
+  padding: 10px 12px;
+  font-size: 14px;
+  font-weight: 500;
+  background: var(--tg-search-bg);
+  color: var(--tg-text);
+}
+
+.settings-segment button:hover {
+  border-color: var(--tg-blue);
+}
+
+.settings-segment button.active {
+  background: var(--tg-blue);
+  border-color: var(--tg-blue);
+  color: #fff;
+}

@@ -8,8 +8,8 @@
 import SwiftUI
 
 struct ContentView: View {
-    @StateObject private var session = SessionStore()
-    @StateObject private var theme = ThemeStore()
+    @EnvironmentObject private var session: SessionStore
+    @EnvironmentObject private var theme: ThemeStore
     @Environment(\.scenePhase) private var scenePhase
 
     var body: some View {
@@ -31,7 +31,7 @@ struct ContentView: View {
         .onAppear {
             session.handleScenePhase(scenePhase)
         }
-        .onChange(of: scenePhase) { _, phase in
+        .onChange(of: scenePhase) { phase in
             session.handleScenePhase(phase)
         }
     }
@@ -39,4 +39,6 @@ struct ContentView: View {
 
 #Preview {
     ContentView()
+        .environmentObject(SessionStore())
+        .environmentObject(ThemeStore())
 }

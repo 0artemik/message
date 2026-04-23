@@ -31,6 +31,15 @@ final class APIClient: @unchecked Sendable {
         NotificationCenter.default.post(name: .apiUnauthorized, object: nil)
     }
 
+    private func applyDefaultHeaders(to req: inout URLRequest) {
+        req.setValue("ios", forHTTPHeaderField: "X-Client-Type")
+        req.setValue("1", forHTTPHeaderField: "ngrok-skip-browser-warning")
+        req.setValue("MessageiOS/1.0", forHTTPHeaderField: "User-Agent")
+        if let h = bearerHeader() {
+            req.setValue(h, forHTTPHeaderField: "Authorization")
+        }
+    }
+
     private func decodeErrorMessage(from data: Data) -> String? {
         if
             let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -41,6 +50,24 @@ final class APIClient: @unchecked Sendable {
         }
         let text = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
         return (text?.isEmpty == false) ? text : nil
+    }
+
+    private func isHTMLResponse(data: Data, response: HTTPURLResponse) -> Bool {
+        let contentType = response.value(forHTTPHeaderField: "Content-Type")?.lowercased() ?? ""
+        if contentType.contains("text/html") { return true }
+        guard let text = String(data: data, encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        else {
+            return false
+        }
+        return text.hasPrefix("<!doctype html") || text.hasPrefix("<html")
+    }
+
+    private func validateNonHTML(data: Data, response: HTTPURLResponse) throws {
+        guard !isHTMLResponse(data: data, response: response) else {
+            throw APIError.status(502, "Туннель вернул HTML вместо API-ответа. Если используете ngrok, нужен bypass interstitial.")
+        }
     }
 
     func setToken(_ value: String?) {
@@ -66,10 +93,7 @@ final class APIClient: @unchecked Sendable {
         }
         var req = URLRequest(url: url)
         req.httpMethod = method
-        req.setValue("ios", forHTTPHeaderField: "X-Client-Type")
-        if let h = bearerHeader() {
-            req.setValue(h, forHTTPHeaderField: "Authorization")
-        }
+        applyDefaultHeaders(to: &req)
         if let jsonBody {
             req.setValue("application/json", forHTTPHeaderField: "Content-Type")
             req.httpBody = try JSONSerialization.data(withJSONObject: jsonBody)
@@ -80,6 +104,7 @@ final class APIClient: @unchecked Sendable {
             notifyUnauthorizedIfNeeded(statusCode: http.statusCode)
             throw APIError.status(http.statusCode, decodeErrorMessage(from: data))
         }
+        try validateNonHTML(data: data, response: http)
         return data
     }
 
@@ -89,16 +114,14 @@ final class APIClient: @unchecked Sendable {
             throw APIError.invalidURL
         }
         var req = URLRequest(url: url)
-        req.setValue("ios", forHTTPHeaderField: "X-Client-Type")
-        if let h = bearerHeader() {
-            req.setValue(h, forHTTPHeaderField: "Authorization")
-        }
+        applyDefaultHeaders(to: &req)
         let (data, resp) = try await URLSession.shared.data(for: req)
         guard let http = resp as? HTTPURLResponse else { throw APIError.status(-1, nil) }
         if http.statusCode >= 400 {
             notifyUnauthorizedIfNeeded(statusCode: http.statusCode)
             throw APIError.status(http.statusCode, decodeErrorMessage(from: data))
         }
+        try validateNonHTML(data: data, response: http)
         return data
     }
 
@@ -107,16 +130,14 @@ final class APIClient: @unchecked Sendable {
             throw APIError.invalidURL
         }
         var req = URLRequest(url: url)
-        req.setValue("ios", forHTTPHeaderField: "X-Client-Type")
-        if let h = bearerHeader() {
-            req.setValue(h, forHTTPHeaderField: "Authorization")
-        }
+        applyDefaultHeaders(to: &req)
         let (data, resp) = try await URLSession.shared.data(for: req)
         guard let http = resp as? HTTPURLResponse else { throw APIError.status(-1, nil) }
         if http.statusCode >= 400 {
             notifyUnauthorizedIfNeeded(statusCode: http.statusCode)
             throw APIError.status(http.statusCode, decodeErrorMessage(from: data))
         }
+        try validateNonHTML(data: data, response: http)
         return data
     }
 
@@ -191,6 +212,54 @@ final class APIClient: @unchecked Sendable {
             method: "POST",
             jsonBody: ["oldPassword": oldPassword, "newPassword": newPassword]
         )
+    }
+
+    func updateProfile(displayName: String) async throws -> UserDTO {
+        let data = try await request(
+            "/api/auth/profile",
+            method: "PUT",
+            jsonBody: ["displayName": displayName]
+        )
+        struct Response: Decodable, Sendable {
+            let user: UserDTO
+        }
+        return try JSONDecoder().decode(Response.self, from: data).user
+    }
+
+    func uploadAvatar(data: Data, fileName: String = "avatar.jpg", mimeType: String = "image/jpeg") async throws -> UserDTO {
+        guard let url = URL(string: "/api/auth/avatar", relativeTo: APIConfig.baseURL) else {
+            throw APIError.invalidURL
+        }
+        let boundary = "Boundary-\(UUID().uuidString)"
+        var body = Data()
+        body.append("--\(boundary)\r\n".data(using: .utf8)!)
+        body.append("Content-Disposition: form-data; name=\"avatar\"; filename=\"\(fileName)\"\r\n".data(using: .utf8)!)
+        body.append("Content-Type: \(mimeType)\r\n\r\n".data(using: .utf8)!)
+        body.append(data)
+        body.append("\r\n--\(boundary)--\r\n".data(using: .utf8)!)
+
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        applyDefaultHeaders(to: &req)
+        req.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
+        req.httpBody = body
+
+        let (responseData, resp) = try await URLSession.shared.data(for: req)
+        guard let http = resp as? HTTPURLResponse else { throw APIError.status(-1, nil) }
+        if http.statusCode >= 400 {
+            notifyUnauthorizedIfNeeded(statusCode: http.statusCode)
+            throw APIError.status(http.statusCode, decodeErrorMessage(from: responseData))
+        }
+        try validateNonHTML(data: responseData, response: http)
+        struct Response: Decodable, Sendable {
+            let user: UserDTO
+        }
+        return try JSONDecoder().decode(Response.self, from: responseData).user
+    }
+
+    func downloadAvatar(path: String) async throws -> Data {
+        let normalized = path.hasPrefix("/") ? path : "/\(path)"
+        return try await request(normalized)
     }
 
     func sessions() async throws -> [AuthSessionDTO] {
@@ -288,11 +357,8 @@ final class APIClient: @unchecked Sendable {
 
         var req = URLRequest(url: url)
         req.httpMethod = "POST"
-        req.setValue("ios", forHTTPHeaderField: "X-Client-Type")
+        applyDefaultHeaders(to: &req)
         req.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
-        if let h = bearerHeader() {
-            req.setValue(h, forHTTPHeaderField: "Authorization")
-        }
         req.httpBody = body
 
         let (data, resp) = try await URLSession.shared.data(for: req)
@@ -301,6 +367,7 @@ final class APIClient: @unchecked Sendable {
             notifyUnauthorizedIfNeeded(statusCode: http.statusCode)
             throw APIError.status(http.statusCode, decodeErrorMessage(from: data))
         }
+        try validateNonHTML(data: data, response: http)
         return data
     }
 
@@ -349,6 +416,24 @@ final class APIClient: @unchecked Sendable {
             fileURL: fileURL,
             fileName: safeName.isEmpty ? "file" : safeName,
             mimeType: mimeType.isEmpty ? "application/octet-stream" : mimeType
+        )
+        return try decodeMessageWrapper(data)
+    }
+    
+    func editMessage(messageId: Int, body: String) async throws -> MessageDTO {
+        let data = try await request(
+            "/api/messages/\(messageId)",
+            method: "PUT",
+            jsonBody: ["body": body]
+        )
+        return try decodeMessageWrapper(data)
+    }
+    
+    func deleteMessage(messageId: Int, deleteForAll: Bool = false) async throws -> MessageDTO {
+        let data = try await request(
+            "/api/messages/\(messageId)",
+            method: "DELETE",
+            jsonBody: ["deleteForAll": deleteForAll ? "true" : "false"]
         )
         return try decodeMessageWrapper(data)
     }

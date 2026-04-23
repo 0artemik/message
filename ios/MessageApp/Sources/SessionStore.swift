@@ -67,9 +67,19 @@ final class SessionStore: ObservableObject {
             guard let url = URL(string: "/api/auth/me", relativeTo: APIConfig.baseURL) else { return }
             var req = URLRequest(url: url)
             req.setValue("ios", forHTTPHeaderField: "X-Client-Type")
+            req.setValue("1", forHTTPHeaderField: "ngrok-skip-browser-warning")
+            req.setValue("MessageiOS/1.0", forHTTPHeaderField: "User-Agent")
             req.setValue("Bearer \(t)", forHTTPHeaderField: "Authorization")
             let (data, resp) = try await URLSession.shared.data(for: req)
             guard let http = resp as? HTTPURLResponse else {
+                isRestoringSession = false
+                return
+            }
+            if
+                let contentType = http.value(forHTTPHeaderField: "Content-Type")?.lowercased(),
+                contentType.contains("text/html")
+            {
+                APIClient.shared.setToken(t)
                 isRestoringSession = false
                 return
             }
@@ -129,6 +139,16 @@ final class SessionStore: ObservableObject {
         isRestoringSession = false
         UserDefaults.standard.removeObject(forKey: key)
         Task { APIClient.shared.setToken(nil) }
+    }
+
+    func updateDisplayName(_ displayName: String) async throws {
+        let updated = try await APIClient.shared.updateProfile(displayName: displayName)
+        user = updated
+    }
+
+    func updateAvatar(data: Data, fileName: String = "avatar.jpg", mimeType: String = "image/jpeg") async throws {
+        let updated = try await APIClient.shared.uploadAvatar(data: data, fileName: fileName, mimeType: mimeType)
+        user = updated
     }
 
     private func registerPushTokenIfPossible() async {

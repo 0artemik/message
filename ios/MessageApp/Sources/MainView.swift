@@ -1,3 +1,4 @@
+import PhotosUI
 import SwiftUI
 import UserNotifications
 
@@ -54,12 +55,13 @@ struct MainView: View {
 
                 Section {
                     ForEach(conversations) { conv in
-                        NavigationLink(value: conv.id) {
+                        Button {
+                            openConversation(conv.id)
+                        } label: {
                             conversationRow(conv)
                         }
-                        .simultaneousGesture(TapGesture().onEnded {
-                            activeConversationId = conv.id
-                        })
+                        .buttonStyle(.plain)
+                        .contentShape(Rectangle())
                         .listRowBackground(c.sidebar)
                         .listRowSeparatorTint(c.border.opacity(0.6))
                     }
@@ -67,12 +69,13 @@ struct MainView: View {
                     sectionHeader("Чаты")
                 }
             }
+            .scrollDismissesKeyboard(.interactively)
             .listStyle(.plain)
             .scrollContentBackground(.hidden)
             .background(c.chatBg)
             .navigationTitle("Чаты")
             .navigationBarTitleDisplayMode(.inline)
-            .onChange(of: searchText) { _, value in
+            .onChange(of: searchText) { value in
                 scheduleSearch(value)
             }
             .toolbarBackground(c.header, for: .navigationBar)
@@ -130,7 +133,7 @@ struct MainView: View {
             TextField(
                 "",
                 text: $searchText,
-                prompt: Text("Поиск пользователей").foregroundStyle(theme.isDark ? Color.white.opacity(0.65) : c.textSecondary)
+                prompt: Text("Поиск пользователей").foregroundColor(theme.isDark ? Color.white.opacity(0.65) : c.textSecondary)
             )
             .textInputAutocapitalization(.never)
             .autocorrectionDisabled()
@@ -159,18 +162,8 @@ struct MainView: View {
     private func conversationRow(_ conv: ConversationDTO) -> some View {
         HStack(spacing: 12) {
             ZStack {
-                Circle()
-                    .fill(
-                        LinearGradient(
-                            colors: [c.blue.opacity(0.85), c.blue],
-                            startPoint: .topLeading,
-                            endPoint: .bottomTrailing
-                        )
-                    )
-                    .frame(width: 52, height: 52)
-                Text(initials(conv.peer.displayName))
-                    .font(.headline.weight(.semibold))
-                    .foregroundStyle(.white)
+                AvatarCircleView(user: conv.peer, size: 52)
+                    .environmentObject(theme)
                 if presence[conv.peer.id]?.online == true {
                     Circle()
                         .fill(c.online)
@@ -205,18 +198,8 @@ struct MainView: View {
     private func userRow(_ user: UserDTO) -> some View {
         HStack(spacing: 12) {
             ZStack {
-                Circle()
-                    .fill(
-                        LinearGradient(
-                            colors: [c.blue.opacity(0.85), c.blue],
-                            startPoint: .topLeading,
-                            endPoint: .bottomTrailing
-                        )
-                    )
-                    .frame(width: 52, height: 52)
-                Text(initials(user.displayName))
-                    .font(.headline.weight(.semibold))
-                    .foregroundStyle(.white)
+                AvatarCircleView(user: user, size: 52)
+                    .environmentObject(theme)
                 if presence[user.id]?.online == true {
                     Circle()
                         .fill(c.online)
@@ -237,13 +220,6 @@ struct MainView: View {
             Spacer(minLength: 0)
         }
         .padding(.vertical, 4)
-    }
-
-    private func initials(_ name: String) -> String {
-        let p = name.split(separator: " ").map(String.init)
-        let a = p.first?.first.map(String.init) ?? "?"
-        let b = p.dropFirst().first?.first.map(String.init) ?? ""
-        return (a + b).uppercased()
     }
 
     private func subtitle(_ c: ConversationDTO) -> String {
@@ -364,13 +340,20 @@ struct MainView: View {
         }
     }
 
+    private func openConversation(_ conversationId: Int) {
+        activeConversationId = conversationId
+        path.append(conversationId)
+    }
+
     private func openDirect(with user: UserDTO) async {
         do {
             let conv = try await APIClient.shared.createDirectConversation(userId: user.id)
             searchText = ""
             searchResults = []
             await load()
-            path.append(conv.id)
+            await MainActor.run {
+                openConversation(conv.id)
+            }
         } catch {
             errorText = (error as? LocalizedError)?.errorDescription ?? "Не удалось открыть чат"
         }
@@ -393,6 +376,11 @@ struct SettingsSheet: View {
     @State private var sessions: [AuthSessionDTO] = []
     @State private var sessionsBusy = false
     @State private var sessionsError: String?
+    @State private var displayName = ""
+    @State private var profileBusy = false
+    @State private var profileError: String?
+    @State private var profileSuccess: String?
+    @State private var showNameEditor = false
 
     var body: some View {
         NavigationStack {
@@ -410,12 +398,35 @@ struct SettingsSheet: View {
                     switch tab {
                     case .general:
                         Section {
-                            Text(session.user?.displayName ?? "")
-                                .font(.headline)
-                                .foregroundStyle(c.text)
-                            Text("@\(session.user?.username ?? "")")
-                                .font(.caption)
-                                .foregroundStyle(c.textSecondary)
+                            if let user = session.user {
+                                ProfileHeroCard(
+                                    user: user,
+                                    subtitle: "Это ваш профиль",
+                                    avatarBusy: profileBusy,
+                                    onAvatarPicked: { item in
+                                        guard let item else { return }
+                                        Task { await uploadAvatar(from: item) }
+                                    },
+                                    onEditName: {
+                                        showNameEditor = true
+                                    }
+                                )
+                                    .environmentObject(theme)
+                                    .listRowInsets(EdgeInsets(top: 8, leading: 0, bottom: 8, trailing: 0))
+                                    .listRowBackground(Color.clear)
+                            }
+                        }
+                        Section {
+                            if let profileError {
+                                Text(profileError)
+                                    .font(.footnote)
+                                    .foregroundStyle(.red)
+                            }
+                            if let profileSuccess {
+                                Text(profileSuccess)
+                                    .font(.footnote)
+                                    .foregroundStyle(.green)
+                            }
                         }
                         Section("Тема оформления") {
                             Picker("Тема", selection: Binding(
@@ -505,6 +516,7 @@ struct SettingsSheet: View {
                         }
                     }
                 }
+                .scrollDismissesKeyboard(.interactively)
             }
             .scrollContentBackground(.hidden)
             .background(c.chatBg)
@@ -523,6 +535,52 @@ struct SettingsSheet: View {
                 if tab == .sessions {
                     await loadSessions()
                 }
+            }
+            .onAppear {
+                displayName = session.user?.displayName ?? ""
+            }
+            .onChange(of: session.user?.displayName) { value in
+                displayName = value ?? ""
+            }
+            .sheet(isPresented: $showNameEditor) {
+                NavigationStack {
+                    Form {
+                        Section("Имя профиля") {
+                            TextField("Имя", text: $displayName)
+                        }
+
+                        if let profileError {
+                            Section {
+                                Text(profileError)
+                                    .font(.footnote)
+                                    .foregroundStyle(.red)
+                            }
+                        }
+                    }
+                    .scrollDismissesKeyboard(.interactively)
+                    .navigationTitle("Изменить имя")
+                    .navigationBarTitleDisplayMode(.inline)
+                    .toolbar {
+                        ToolbarItem(placement: .cancellationAction) {
+                            Button("Отмена") {
+                                displayName = session.user?.displayName ?? ""
+                                showNameEditor = false
+                            }
+                        }
+                        ToolbarItem(placement: .confirmationAction) {
+                            Button(profileBusy ? "Сохранение..." : "Сохранить") {
+                                Task {
+                                    await saveDisplayName()
+                                    if profileError == nil {
+                                        showNameEditor = false
+                                    }
+                                }
+                            }
+                            .disabled(profileBusy || displayName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                        }
+                    }
+                }
+                .presentationDetents([.height(220)])
             }
         }
         .preferredColorScheme(theme.isDark ? .dark : .light)
@@ -588,6 +646,45 @@ struct SettingsSheet: View {
             sessions = try await APIClient.shared.sessions()
         } catch {
             sessionsError = (error as? LocalizedError)?.errorDescription ?? "Не удалось завершить другие сеансы"
+        }
+    }
+
+    private func saveDisplayName() async {
+        let trimmed = displayName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            profileError = "Имя не должно быть пустым"
+            profileSuccess = nil
+            return
+        }
+        profileBusy = true
+        defer { profileBusy = false }
+        profileError = nil
+        profileSuccess = nil
+        do {
+            try await session.updateDisplayName(trimmed)
+            displayName = session.user?.displayName ?? trimmed
+            profileSuccess = "Имя обновлено"
+        } catch {
+            profileError = (error as? LocalizedError)?.errorDescription ?? "Не удалось обновить имя"
+        }
+    }
+
+    private func uploadAvatar(from item: PhotosPickerItem) async {
+        profileBusy = true
+        defer { profileBusy = false }
+        profileError = nil
+        profileSuccess = nil
+        do {
+            guard let data = try await item.loadTransferable(type: Data.self), !data.isEmpty else {
+                profileError = "Не удалось прочитать фото"
+                return
+            }
+            let mimeType = item.supportedContentTypes.first?.preferredMIMEType ?? "image/jpeg"
+            let ext = item.supportedContentTypes.first?.preferredFilenameExtension ?? "jpg"
+            try await session.updateAvatar(data: data, fileName: "avatar.\(ext)", mimeType: mimeType)
+            profileSuccess = "Фото обновлено"
+        } catch {
+            profileError = (error as? LocalizedError)?.errorDescription ?? "Не удалось обновить фото"
         }
     }
 }

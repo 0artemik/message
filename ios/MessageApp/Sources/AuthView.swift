@@ -11,6 +11,9 @@ struct AuthView: View {
     @State private var password = ""
     @State private var errorText: String?
     @State private var busy = false
+    @State private var showServerSheet = false
+    @State private var backendHost = APIConfig.backendHost
+    @State private var backendPort = APIConfig.backendPort
 
     private var c: TelegramPalette { theme.palette }
 
@@ -25,11 +28,28 @@ struct AuthView: View {
 
             ScrollView {
                 VStack(spacing: 20) {
+                    HStack {
+                        Spacer()
+                        Button {
+                            backendHost = APIConfig.backendHost
+                            backendPort = APIConfig.backendPort
+                            showServerSheet = true
+                        } label: {
+                            Image(systemName: "server.rack")
+                                .font(.system(size: 14, weight: .semibold))
+                                .foregroundStyle(.white)
+                                .frame(width: 34, height: 34)
+                                .background(Color.white.opacity(0.16))
+                                .clipShape(Circle())
+                        }
+                        .padding(.trailing, 28)
+                    }
+                    .padding(.top, 20)
+
                     Text("✈")
                         .font(.system(size: 56))
                         .foregroundStyle(.white)
                         .rotationEffect(.degrees(-12))
-                        .padding(.top, 24)
 
                     Text("Message")
                         .font(.title.bold())
@@ -101,6 +121,43 @@ struct AuthView: View {
                     .padding(.bottom, 32)
                 }
             }
+            .scrollDismissesKeyboard(.interactively)
+        }
+        .sheet(isPresented: $showServerSheet) {
+            NavigationStack {
+                Form {
+                    Section("Локальный backend") {
+                        TextField("IP Mac", text: $backendHost)
+                            .keyboardType(.numbersAndPunctuation)
+                            .textInputAutocapitalization(.never)
+                            .autocorrectionDisabled()
+                        TextField("Порт", text: $backendPort)
+                            .keyboardType(.numberPad)
+                        Text("Текущий адрес: \(APIConfig.baseURL.absoluteString)")
+                            .font(.footnote)
+                            .foregroundStyle(c.textSecondary)
+                    }
+
+                    Section {
+                        Button("Сохранить") {
+                            APIConfig.updateBackend(host: backendHost, port: backendPort)
+                            errorText = nil
+                            showServerSheet = false
+                        }
+                    }
+                }
+                .scrollDismissesKeyboard(.interactively)
+                .scrollContentBackground(.hidden)
+                .background(c.chatBg)
+                .preferredColorScheme(theme.isDark ? .dark : .light)
+                .navigationTitle("Сервер")
+                .toolbar {
+                    ToolbarItem(placement: .cancellationAction) {
+                        Button("Закрыть") { showServerSheet = false }
+                    }
+                }
+            }
+            .preferredColorScheme(theme.isDark ? .dark : .light)
         }
     }
 

@@ -1,0 +1,7 @@
+#Mon Apr 20 16:05:23 MSK 2026
+base.0=/Users/mac/Desktop/qwe/projects/message/android/app/build/intermediates/dex/debugAndroidTest/mergeProjectDexDebugAndroidTest/0/classes.dex
+base.1=/Users/mac/Desktop/qwe/projects/message/android/app/build/intermediates/dex/debugAndroidTest/mergeProjectDexDebugAndroidTest/8/classes.dex
+path.0=0/classes.dex
+path.1=8/classes.dex
+renamed.0=classes.dex
+renamed.1=classes2.dex

@@ -9,7 +9,7 @@ function pickVideoMime() {
   return "";
 }
 
-export default function VideoNoteModal({ open, conversationId, onClose, onSent }) {
+export default function VideoNoteModal({ open, conversationId, replyToMessageId, onClose, onSent }) {
   const videoRef = useRef(null);
   const streamRef = useRef(null);
   const recRef = useRef(null);
@@ -140,7 +140,13 @@ export default function VideoNoteModal({ open, conversationId, onClose, onSent }
     }
     try {
       setPhaseBoth("uploading");
-      await uploadVideoNote(conversationId, blob, durationMs, (p) => setUploadProgress(p));
+      await uploadVideoNote(
+        conversationId,
+        blob,
+        durationMs,
+        (p) => setUploadProgress(p),
+        { replyToMessageId }
+      );
       onSent?.();
       onClose();
     } catch (e) {

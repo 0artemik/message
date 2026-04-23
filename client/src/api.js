@@ -33,10 +33,11 @@ export async function api(path, options = {}) {
   return data;
 }
 
-export async function uploadVoice(conversationId, blob, durationMs) {
+export async function uploadVoice(conversationId, blob, durationMs, options = {}) {
   const fd = new FormData();
   fd.append("audio", blob, "voice.webm");
   fd.append("durationMs", String(durationMs ?? ""));
+  if (options.replyToMessageId) fd.append("replyToMessageId", String(options.replyToMessageId));
   const headers = { "X-Client-Type": "web" };
   const token = getToken();
   if (token) headers.Authorization = `Bearer ${token}`;
@@ -63,10 +64,11 @@ export async function uploadVoice(conversationId, blob, durationMs) {
   return data;
 }
 
-export async function uploadVideoNote(conversationId, blob, durationMs, onProgress) {
+export async function uploadVideoNote(conversationId, blob, durationMs, onProgress, options = {}) {
   const fd = new FormData();
   fd.append("video", blob, "note.webm");
   fd.append("durationMs", String(durationMs ?? ""));
+  if (options.replyToMessageId) fd.append("replyToMessageId", String(options.replyToMessageId));
   return uploadMultipart(`/conversations/${conversationId}/messages/video-note`, fd, onProgress);
 }
 
@@ -106,16 +108,36 @@ function uploadMultipart(path, formData, onProgress) {
   });
 }
 
-export async function uploadFileAttachment(conversationId, file, caption = "", onProgress) {
+export async function uploadFileAttachment(conversationId, file, caption = "", onProgress, options = {}) {
   const fd = new FormData();
   fd.append("file", file);
   if (caption) fd.append("caption", caption);
+  if (options.replyToMessageId) fd.append("replyToMessageId", String(options.replyToMessageId));
   return uploadMultipart(`/conversations/${conversationId}/messages/file`, fd, onProgress);
 }
 
 export async function fetchMediaBlobUrl(messageId) {
+  const res = await fetchWithAuth(`${API}/messages/${messageId}/media`);
+  const blob = await res.blob();
+  return URL.createObjectURL(blob);
+}
+
+export async function fetchAvatarBlobUrl(avatarUrl) {
+  if (!avatarUrl) throw new Error("avatar");
+  const res = await fetchWithAuth(avatarUrl);
+  const blob = await res.blob();
+  return URL.createObjectURL(blob);
+}
+
+export async function uploadAvatar(file) {
+  const fd = new FormData();
+  fd.append("avatar", file);
+  return uploadMultipart("/auth/avatar", fd);
+}
+
+async function fetchWithAuth(url) {
   const token = getToken();
-  const res = await fetch(`${API}/messages/${messageId}/media`, {
+  const res = await fetch(url, {
     headers: token
       ? { Authorization: `Bearer ${token}`, "X-Client-Type": "web" }
       : { "X-Client-Type": "web" },
@@ -124,10 +146,9 @@ export async function fetchMediaBlobUrl(messageId) {
     if (res.status === 401) {
       window.dispatchEvent(new CustomEvent(AUTH_EXPIRED_EVENT));
     }
-    throw new Error("media");
+    throw new Error("fetch");
   }
-  const blob = await res.blob();
-  return URL.createObjectURL(blob);
+  return res;
 }
 
 export async function downloadMessageFile(messageId, fileName) {
@@ -150,6 +171,34 @@ export async function downloadMessageFile(messageId, fileName) {
   a.download = fileName || "file";
   a.click();
   URL.revokeObjectURL(url);
+}
+
+export async function editMessage(messageId, body) {
+  return api(`/messages/${messageId}`, {
+    method: "PUT",
+    body: { body },
+  });
+}
+
+export async function updateProfile(displayName) {
+  return api("/auth/profile", {
+    method: "PUT",
+    body: { displayName },
+  });
+}
+
+export async function deleteMessage(messageId, deleteForAll = false) {
+  return api(`/messages/${messageId}`, {
+    method: "DELETE",
+    body: { deleteForAll },
+  });
+}
+
+export async function forwardMessage(messageId, conversationId) {
+  return api(`/messages/${messageId}/forward`, {
+    method: "POST",
+    body: { conversationId },
+  });
 }
 
 export { AUTH_EXPIRED_EVENT };

@@ -17,7 +17,8 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const voiceDir = path.join(__dirname, "uploads", "voice");
 const videoDir = path.join(__dirname, "uploads", "video_note");
 const fileDir = path.join(__dirname, "uploads", "files");
-for (const d of [voiceDir, videoDir, fileDir]) {
+const avatarDir = path.join(__dirname, "uploads", "avatars");
+for (const d of [voiceDir, videoDir, fileDir, avatarDir]) {
   fs.mkdirSync(d, { recursive: true });
 }
 
@@ -93,7 +94,11 @@ function broadcastPresence(userId, online) {
   const lastSeenAt = row?.last_seen_at ?? null;
   const partners = getPartnerUserIds(userId);
   for (const pid of partners) {
-    io.to(`uid:${pid}`).emit("presence", { userId, online, lastSeenAt });
+    io.to(`uid:${pid}`).emit("presence", {
+      userId,
+      online,
+      lastSeenAt: normalizeTimestamp(lastSeenAt),
+    });
   }
 }
 
@@ -149,7 +154,7 @@ function sendPresenceSnapshot(socket, userId) {
     socket.emit("presence", {
       userId: pid,
       online,
-      lastSeenAt: row?.last_seen_at ?? null,
+      lastSeenAt: normalizeTimestamp(row?.last_seen_at ?? null),
     });
   }
 }
@@ -167,7 +172,89 @@ function messageToPayload(msg, conversationId) {
     fileSize: msg.file_size ?? null,
     videoDurationMs: msg.video_duration_ms ?? null,
     clientMsgId: msg.client_msg_id ?? null,
-    createdAt: msg.created_at,
+    replyTo: msg.reply_to ?? null,
+    forwardFrom: msg.forward_from ?? null,
+    editedAt: msg.edited_at ?? null,
+    deletedForSelf: msg.deleted_for_self ?? null,
+    deletedForAll: msg.deleted_for_all ?? null,
+    createdAt: normalizeTimestamp(msg.created_at),
+  };
+}
+
+function previewBodyFromMessage(msg) {
+  if (!msg) return "";
+  if (msg.deleted_for_all) return "Удаленное сообщение";
+  if (msg.kind === "voice") return "Голосовое сообщение";
+  if (msg.kind === "video_note") return "Видеосообщение";
+  if (msg.kind === "file") return msg.file_name ? `📎 ${msg.file_name}` : "Файл";
+  return String(msg.body || "");
+}
+
+function messagePreview(msg, senderName) {
+  if (!msg) return null;
+  return {
+    id: msg.id,
+    senderId: msg.sender_id,
+    senderName: senderName || "Пользователь",
+    body: previewBodyFromMessage(msg),
+    kind: msg.kind || "text",
+    fileName: msg.file_name ?? null,
+  };
+}
+
+function resolveReplyPreview(replyToMessageId) {
+  if (!replyToMessageId) return null;
+  const row = db
+    .prepare(
+      `SELECT m.id, m.sender_id, m.body, m.kind, m.file_name, m.deleted_for_all, u.display_name AS sender_name
+       FROM messages m
+       LEFT JOIN users u ON u.id = m.sender_id
+       WHERE m.id = ?`
+    )
+    .get(replyToMessageId);
+  return messagePreview(row, row?.sender_name);
+}
+
+function resolveForwardPreview(msg) {
+  const forwardMessageId = Number(msg?.forward_from_message_id || 0);
+  const forwardSenderId = Number(msg?.forward_from_sender_id || 0);
+  if (!forwardMessageId && !forwardSenderId) return null;
+  const source = forwardMessageId
+    ? db
+        .prepare(
+          `SELECT m.id, m.sender_id, m.body, m.kind, m.file_name, m.deleted_for_all,
+                  u.display_name AS sender_name
+           FROM messages m
+           LEFT JOIN users u ON u.id = COALESCE(?, m.sender_id)
+           WHERE m.id = ?`
+        )
+        .get(forwardSenderId || null, forwardMessageId)
+    : null;
+  if (source) {
+    return messagePreview(
+      { ...source, sender_id: forwardSenderId || source.sender_id },
+      source.sender_name
+    );
+  }
+  const sender = forwardSenderId
+    ? db.prepare("SELECT display_name FROM users WHERE id = ?").get(forwardSenderId)
+    : null;
+  return {
+    id: forwardMessageId || null,
+    senderId: forwardSenderId || null,
+    senderName: sender?.display_name || "Пользователь",
+    body: "",
+    kind: msg.kind || "text",
+    fileName: msg.file_name ?? null,
+  };
+}
+
+function enrichMessage(msg) {
+  if (!msg) return null;
+  return {
+    ...msg,
+    reply_to: resolveReplyPreview(msg.reply_to_message_id),
+    forward_from: resolveForwardPreview(msg),
   };
 }
 
@@ -212,9 +299,18 @@ function lastMessageFromRow(r) {
     body,
     kind,
     fileName: r.last_file_name ?? null,
-    createdAt: r.last_created_at,
+    createdAt: normalizeTimestamp(r.last_created_at),
     senderId: r.last_sender_id,
   };
+}
+
+function normalizeTimestamp(value) {
+  if (!value) return null;
+  const raw = String(value).trim();
+  if (!raw) return null;
+  if (/[zZ]$|[+\-]\d{2}:\d{2}$/.test(raw)) return raw;
+  if (raw.includes("T")) return `${raw}Z`;
+  return `${raw.replace(" ", "T")}Z`;
 }
 
 function safeFilename(name) {
@@ -391,6 +487,26 @@ const uploadAttachment = multer({
   limits: { fileSize: 40 * 1024 * 1024 },
 });
 
+const avatarStorage = multer.diskStorage({
+  destination: (_req, _file, cb) => cb(null, avatarDir),
+  filename: (_req, file, cb) => {
+    const ext = extFromMime(file.mimetype) || path.extname(safeFilename(file.originalname)) || ".jpg";
+    cb(null, `${randomUUID()}${ext}`);
+  },
+});
+
+const uploadAvatar = multer({
+  storage: avatarStorage,
+  limits: { fileSize: 8 * 1024 * 1024 },
+  fileFilter: (_req, file, cb) => {
+    if (file.mimetype.startsWith("image/") || file.mimetype === "application/octet-stream") {
+      cb(null, true);
+    } else {
+      cb(new Error("Нужна картинка"));
+    }
+  },
+});
+
 function authMiddleware(req, res, next) {
   const h = req.headers.authorization;
   if (!h?.startsWith("Bearer ")) {
@@ -430,17 +546,32 @@ function userPublic(row) {
     id: row.id,
     username: row.username,
     displayName: row.display_name,
+    avatarUrl: row.avatar_path
+      ? `/api/users/${row.id}/avatar?v=${encodeURIComponent(row.avatar_path)}`
+      : null,
   };
 }
 
+function safeUnlink(filePath) {
+  if (!filePath) return;
+  try {
+    if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+  } catch {
+    /* ignore */
+  }
+}
+
 function selectFullMessage(id) {
-  return db
+  const row = db
     .prepare(
       `SELECT id, sender_id, body, created_at, kind, voice_duration_ms, voice_path,
-              file_path, file_name, file_mime, file_size, video_duration_ms, client_msg_id
+              file_path, file_name, file_mime, file_size, video_duration_ms, client_msg_id,
+              reply_to_message_id, forward_from_message_id, forward_from_sender_id,
+              edited_at, deleted_for_self, deleted_for_all
        FROM messages WHERE id = ?`
     )
     .get(id);
+  return enrichMessage(row);
 }
 
 function assertConvMember(convId, userId) {
@@ -467,7 +598,7 @@ app.post("/api/auth/register", (req, res) => {
       )
       .run(u, e, hash, dn);
     const token = createSessionAndToken(req, info.lastInsertRowid, u);
-    const row = db.prepare("SELECT id, username, display_name FROM users WHERE id = ?").get(info.lastInsertRowid);
+    const row = db.prepare("SELECT id, username, display_name, avatar_path FROM users WHERE id = ?").get(info.lastInsertRowid);
     touchLastSeen(info.lastInsertRowid);
     res.status(201).json({ token, user: userPublic(row) });
   } catch (err) {
@@ -484,7 +615,7 @@ app.post("/api/auth/login", (req, res) => {
   const p = String(password || "");
   if (!u || !p) return res.status(400).json({ error: "Логин и пароль обязательны" });
   const row = db
-    .prepare("SELECT id, username, password_hash, display_name FROM users WHERE username = ? COLLATE NOCASE")
+    .prepare("SELECT id, username, password_hash, display_name, avatar_path FROM users WHERE username = ? COLLATE NOCASE")
     .get(u);
   if (!row || !bcrypt.compareSync(p, row.password_hash)) {
     return res.status(401).json({ error: "Неверный логин или пароль" });
@@ -517,6 +648,34 @@ app.post("/api/auth/change-password", authMiddleware, (req, res) => {
   res.json({ ok: true });
 });
 
+app.put("/api/auth/profile", authMiddleware, (req, res) => {
+  const displayName = String(req.body?.displayName || "").trim();
+  if (!displayName) {
+    return res.status(400).json({ error: "Имя не должно быть пустым" });
+  }
+  if (displayName.length > 80) {
+    return res.status(400).json({ error: "Имя не длиннее 80 символов" });
+  }
+  db.prepare("UPDATE users SET display_name = ? WHERE id = ?").run(displayName, req.user.sub);
+  const row = db
+    .prepare("SELECT id, username, display_name, avatar_path FROM users WHERE id = ?")
+    .get(req.user.sub);
+  res.json({ user: userPublic(row) });
+});
+
+app.post("/api/auth/avatar", authMiddleware, uploadAvatar.single("avatar"), (req, res) => {
+  if (!req.file) return res.status(400).json({ error: "Не выбрана фотография" });
+  const current = db.prepare("SELECT avatar_path FROM users WHERE id = ?").get(req.user.sub);
+  db.prepare("UPDATE users SET avatar_path = ? WHERE id = ?").run(req.file.filename, req.user.sub);
+  if (current?.avatar_path && current.avatar_path !== req.file.filename) {
+    safeUnlink(path.join(avatarDir, current.avatar_path));
+  }
+  const row = db
+    .prepare("SELECT id, username, display_name, avatar_path FROM users WHERE id = ?")
+    .get(req.user.sub);
+  res.status(201).json({ user: userPublic(row) });
+});
+
 app.get("/api/auth/sessions", authMiddleware, (req, res) => {
   const rows = db
     .prepare(
@@ -532,7 +691,7 @@ app.get("/api/auth/sessions", authMiddleware, (req, res) => {
       sid: r.sid,
       clientType: r.client_type,
       device: r.device,
-      createdAt: r.created_at,
+      createdAt: normalizeTimestamp(r.created_at),
       current: req.user.sid ? r.sid === req.user.sid : false,
     })),
   });
@@ -552,7 +711,7 @@ app.post("/api/auth/sessions/revoke-others", authMiddleware, (req, res) => {
 
 app.get("/api/auth/me", authMiddleware, (req, res) => {
   const row = db
-    .prepare("SELECT id, username, display_name FROM users WHERE id = ?")
+    .prepare("SELECT id, username, display_name, avatar_path FROM users WHERE id = ?")
     .get(req.user.sub);
   if (!row) return res.status(404).json({ error: "Пользователь не найден" });
   res.json({ user: userPublic(row) });
@@ -569,7 +728,9 @@ app.get("/api/presence/batch", authMiddleware, (req, res) => {
   for (const id of unique) {
     out[id] = {
       online: isUserOnline(id),
-      lastSeenAt: db.prepare("SELECT last_seen_at FROM users WHERE id = ?").get(id)?.last_seen_at ?? null,
+      lastSeenAt: normalizeTimestamp(
+        db.prepare("SELECT last_seen_at FROM users WHERE id = ?").get(id)?.last_seen_at ?? null
+      ),
     };
   }
   res.json({ presence: out });
@@ -603,7 +764,7 @@ app.get("/api/users/search", authMiddleware, (req, res) => {
   const like = `%${q.replace(/%/g, "").replace(/_/g, "")}%`;
   const rows = db
     .prepare(
-      `SELECT id, username, display_name FROM users
+      `SELECT id, username, display_name, avatar_path FROM users
        WHERE id != ? AND (username LIKE ? COLLATE NOCASE OR display_name LIKE ? COLLATE NOCASE)
        ORDER BY username COLLATE NOCASE
        LIMIT 30`
@@ -651,7 +812,7 @@ app.post("/api/conversations/direct", authMiddleware, (req, res) => {
   }
 
   const peer = db
-    .prepare("SELECT id, username, display_name FROM users WHERE id = ?")
+    .prepare("SELECT id, username, display_name, avatar_path FROM users WHERE id = ?")
     .get(otherId);
   const lastMsg = db
     .prepare(
@@ -681,7 +842,7 @@ app.get("/api/conversations", authMiddleware, (req, res) => {
   const rows = db
     .prepare(
       `SELECT c.id AS conversation_id,
-              u.id AS peer_id, u.username AS peer_username, u.display_name AS peer_display_name,
+              u.id AS peer_id, u.username AS peer_username, u.display_name AS peer_display_name, u.avatar_path AS peer_avatar_path,
               m.body AS last_body, m.created_at AS last_created_at, m.sender_id AS last_sender_id,
               m.kind AS last_kind, m.file_name AS last_file_name,
               (
@@ -708,6 +869,7 @@ app.get("/api/conversations", authMiddleware, (req, res) => {
       id: r.peer_id,
       username: r.peer_username,
       display_name: r.peer_display_name,
+      avatar_path: r.peer_avatar_path,
     }),
     lastMessage: lastMessageFromRow(r),
     unreadCount: Number(r.unread_count || 0),
@@ -726,10 +888,14 @@ app.get("/api/conversations/:id/messages", authMiddleware, (req, res) => {
   const rows = db
     .prepare(
       `SELECT id, sender_id, body, created_at, kind, voice_duration_ms,
-              file_name, file_mime, file_size, video_duration_ms, client_msg_id
+              file_name, file_mime, file_size, video_duration_ms, client_msg_id,
+              reply_to_message_id, forward_from_message_id, forward_from_sender_id,
+              edited_at, deleted_for_self, deleted_for_all
        FROM messages
        WHERE conversation_id = ?
          AND (? <= 0 OR id < ?)
+         AND deleted_for_self IS NULL
+         AND deleted_for_all IS NULL
        ORDER BY id DESC
        LIMIT ?`
     )
@@ -738,20 +904,13 @@ app.get("/api/conversations/:id/messages", authMiddleware, (req, res) => {
   const hasMore = rows.length === limit;
   const nextBeforeId = hasMore && asc.length > 0 ? asc[0].id : null;
   res.json({
-    messages: asc.map((m) => ({
-      id: m.id,
-      senderId: m.sender_id,
-      body: m.body ?? "",
-      kind: m.kind || "text",
-      voiceDurationMs: m.voice_duration_ms,
-      fileName: m.file_name,
-      fileMime: m.file_mime,
-      fileSize: m.file_size,
-      videoDurationMs: m.video_duration_ms,
-      clientMsgId: m.client_msg_id ?? null,
-      isRead: m.sender_id === req.user.sub ? m.id <= peerLastRead : true,
-      createdAt: m.created_at,
-    })),
+    messages: asc.map((m) => {
+      const payload = messageToPayload(enrichMessage(m), convId);
+      return {
+        ...payload,
+        isRead: m.sender_id === req.user.sub ? m.id <= peerLastRead : true,
+      };
+    }),
     hasMore,
     nextBeforeId,
   });
@@ -774,26 +933,37 @@ app.post("/api/conversations/:id/messages", authMiddleware, (req, res) => {
   const convId = Number(req.params.id);
   const body = String(req.body?.body ?? "").trim();
   const clientMsgId = String(req.body?.clientMsgId ?? "").trim().slice(0, 120) || null;
+  const replyToMessageId = Number(req.body?.replyToMessageId || 0) || null;
   if (!body) return res.status(400).json({ error: "Пустое сообщение" });
   if (!assertConvMember(convId, req.user.sub)) return res.status(404).json({ error: "Чат не найден" });
+  if (replyToMessageId) {
+    const replyTarget = db
+      .prepare(
+        `SELECT id
+         FROM messages
+         WHERE id = ? AND conversation_id = ? AND deleted_for_all IS NULL`
+      )
+      .get(replyToMessageId, convId);
+    if (!replyTarget) return res.status(400).json({ error: "Сообщение для ответа не найдено" });
+  }
 
   if (clientMsgId) {
     const existing = db
       .prepare(
-        "SELECT id, sender_id, body, created_at, kind, voice_duration_ms, file_name, file_mime, file_size, video_duration_ms, client_msg_id FROM messages WHERE conversation_id = ? AND sender_id = ? AND client_msg_id = ?"
+        "SELECT id, sender_id, body, created_at, kind, voice_duration_ms, file_name, file_mime, file_size, video_duration_ms, client_msg_id, reply_to_message_id, forward_from_message_id, forward_from_sender_id, edited_at, deleted_for_self, deleted_for_all FROM messages WHERE conversation_id = ? AND sender_id = ? AND client_msg_id = ?"
       )
       .get(convId, req.user.sub, clientMsgId);
     if (existing) {
-      const payloadExisting = messageToPayload(existing, convId);
+      const payloadExisting = messageToPayload(enrichMessage(existing), convId);
       return res.status(200).json({ message: payloadExisting });
     }
   }
 
   const info = db
     .prepare(
-      "INSERT INTO messages (conversation_id, sender_id, body, kind, client_msg_id) VALUES (?, ?, ?, 'text', ?)"
+      "INSERT INTO messages (conversation_id, sender_id, body, kind, client_msg_id, reply_to_message_id) VALUES (?, ?, ?, 'text', ?, ?)"
     )
-    .run(convId, req.user.sub, body, clientMsgId);
+    .run(convId, req.user.sub, body, clientMsgId, replyToMessageId);
   const msg = selectFullMessage(info.lastInsertRowid);
   const payload = messageToPayload(msg, convId);
   io.to(`conv:${convId}`).emit("message", payload);
@@ -812,8 +982,19 @@ app.post(
   },
   (req, res) => {
     const convId = Number(req.params.id);
+    const replyToMessageId = Number(req.body?.replyToMessageId || 0) || null;
     if (!assertConvMember(convId, req.user.sub)) return res.status(404).json({ error: "Чат не найден" });
     if (!req.file) return res.status(400).json({ error: "Нет аудио" });
+    if (replyToMessageId) {
+      const replyTarget = db
+        .prepare(
+          `SELECT id
+           FROM messages
+           WHERE id = ? AND conversation_id = ? AND deleted_for_all IS NULL`
+        )
+        .get(replyToMessageId, convId);
+      if (!replyTarget) return res.status(400).json({ error: "Сообщение для ответа не найдено" });
+    }
 
     const durationMs = Math.min(
       600_000,
@@ -823,10 +1004,10 @@ app.post(
 
     const info = db
       .prepare(
-        `INSERT INTO messages (conversation_id, sender_id, body, kind, voice_path, voice_duration_ms)
-         VALUES (?, ?, '', 'voice', ?, ?)`
+        `INSERT INTO messages (conversation_id, sender_id, body, kind, voice_path, voice_duration_ms, reply_to_message_id)
+         VALUES (?, ?, '', 'voice', ?, ?, ?)`
       )
-      .run(convId, req.user.sub, filename, durationMs || null);
+      .run(convId, req.user.sub, filename, durationMs || null, replyToMessageId);
 
     const msg = selectFullMessage(info.lastInsertRowid);
     const payload = messageToPayload(msg, convId);
@@ -847,8 +1028,19 @@ app.post(
   },
   (req, res) => {
     const convId = Number(req.params.id);
+    const replyToMessageId = Number(req.body?.replyToMessageId || 0) || null;
     if (!assertConvMember(convId, req.user.sub)) return res.status(404).json({ error: "Чат не найден" });
     if (!req.file) return res.status(400).json({ error: "Нет видео" });
+    if (replyToMessageId) {
+      const replyTarget = db
+        .prepare(
+          `SELECT id
+           FROM messages
+           WHERE id = ? AND conversation_id = ? AND deleted_for_all IS NULL`
+        )
+        .get(replyToMessageId, convId);
+      if (!replyTarget) return res.status(400).json({ error: "Сообщение для ответа не найдено" });
+    }
 
     const durationMs = Math.min(
       120_000,
@@ -860,10 +1052,10 @@ app.post(
 
     const info = db
       .prepare(
-        `INSERT INTO messages (conversation_id, sender_id, body, kind, file_path, file_mime, file_size, video_duration_ms)
-         VALUES (?, ?, '', 'video_note', ?, ?, ?, ?)`
+        `INSERT INTO messages (conversation_id, sender_id, body, kind, file_path, file_mime, file_size, video_duration_ms, reply_to_message_id)
+         VALUES (?, ?, '', 'video_note', ?, ?, ?, ?, ?)`
       )
-      .run(convId, req.user.sub, filename, mime, size, durationMs || null);
+      .run(convId, req.user.sub, filename, mime, size, durationMs || null, replyToMessageId);
 
     const msg = selectFullMessage(info.lastInsertRowid);
     const payload = messageToPayload(msg, convId);
@@ -884,8 +1076,19 @@ app.post(
   },
   (req, res) => {
     const convId = Number(req.params.id);
+    const replyToMessageId = Number(req.body?.replyToMessageId || 0) || null;
     if (!assertConvMember(convId, req.user.sub)) return res.status(404).json({ error: "Чат не найден" });
     if (!req.file) return res.status(400).json({ error: "Нет файла" });
+    if (replyToMessageId) {
+      const replyTarget = db
+        .prepare(
+          `SELECT id
+           FROM messages
+           WHERE id = ? AND conversation_id = ? AND deleted_for_all IS NULL`
+        )
+        .get(replyToMessageId, convId);
+      if (!replyTarget) return res.status(400).json({ error: "Сообщение для ответа не найдено" });
+    }
 
     const caption = String(req.body?.caption ?? "").trim().slice(0, 4000);
     const orig = safeFilename(req.file.originalname);
@@ -895,10 +1098,10 @@ app.post(
 
     const info = db
       .prepare(
-        `INSERT INTO messages (conversation_id, sender_id, body, kind, file_path, file_name, file_mime, file_size)
-         VALUES (?, ?, ?, 'file', ?, ?, ?, ?)`
+        `INSERT INTO messages (conversation_id, sender_id, body, kind, file_path, file_name, file_mime, file_size, reply_to_message_id)
+         VALUES (?, ?, ?, 'file', ?, ?, ?, ?, ?)`
       )
-      .run(convId, req.user.sub, caption, filename, orig, mime, size);
+      .run(convId, req.user.sub, caption, filename, orig, mime, size, replyToMessageId);
 
     const msg = selectFullMessage(info.lastInsertRowid);
     const payload = messageToPayload(msg, convId);
@@ -945,6 +1148,22 @@ app.get("/api/messages/:messageId/media", authMiddleware, (req, res) => {
   return res.status(404).json({ error: "Нет медиа" });
 });
 
+app.get("/api/users/:userId/avatar", authMiddleware, (req, res) => {
+  const userId = Number(req.params.userId);
+  const row = db.prepare("SELECT avatar_path FROM users WHERE id = ?").get(userId);
+  if (!row?.avatar_path) return res.status(404).json({ error: "Фото не найдено" });
+  const filePath = path.join(avatarDir, row.avatar_path);
+  if (!fs.existsSync(filePath)) return res.status(404).json({ error: "Файл отсутствует" });
+  const ext = path.extname(row.avatar_path).toLowerCase();
+  const mime =
+    ext === ".png" ? "image/png" :
+    ext === ".webp" ? "image/webp" :
+    ext === ".gif" ? "image/gif" :
+    "image/jpeg";
+  res.setHeader("Content-Type", mime);
+  res.sendFile(filePath);
+});
+
 app.get("/api/messages/:messageId/voice", authMiddleware, (req, res) => {
   const messageId = Number(req.params.messageId);
   const row = db
@@ -955,12 +1174,190 @@ app.get("/api/messages/:messageId/voice", authMiddleware, (req, res) => {
     )
     .get(req.user.sub, messageId);
   if (!row || row.kind !== "voice" || !row.voice_path) {
-    return res.status(404).json({ error: "Не найдено" });
+    return res.status(404).json({ error: "Not found" });
   }
   const filePath = path.join(voiceDir, row.voice_path);
-  if (!fs.existsSync(filePath)) return res.status(404).json({ error: "Файл отсутствует" });
+  if (!fs.existsSync(filePath)) return res.status(404).json({ error: "File missing" });
   res.setHeader("Content-Type", "audio/webm");
   res.sendFile(filePath);
+});
+
+app.post("/api/messages/:messageId/forward", authMiddleware, (req, res) => {
+  const sourceMessageId = Number(req.params.messageId);
+  const targetConversationId = Number(req.body?.conversationId || 0);
+  if (!targetConversationId) {
+    return res.status(400).json({ error: "Не указан чат для пересылки" });
+  }
+
+  const source = db
+    .prepare(
+      `SELECT m.id, m.sender_id, m.body, m.kind, m.voice_path, m.voice_duration_ms,
+              m.file_path, m.file_name, m.file_mime, m.file_size, m.video_duration_ms,
+              m.forward_from_message_id, m.forward_from_sender_id
+       FROM messages m
+       JOIN conversation_members cm ON cm.conversation_id = m.conversation_id AND cm.user_id = ?
+       WHERE m.id = ? AND m.deleted_for_all IS NULL`
+    )
+    .get(req.user.sub, sourceMessageId);
+  if (!source) {
+    return res.status(404).json({ error: "Сообщение не найдено" });
+  }
+  if (!assertConvMember(targetConversationId, req.user.sub)) {
+    return res.status(404).json({ error: "Чат не найден" });
+  }
+
+  const forwardFromMessageId = Number(source.forward_from_message_id || source.id);
+  const forwardFromSenderId = Number(source.forward_from_sender_id || source.sender_id);
+  const info = db
+    .prepare(
+      `INSERT INTO messages (
+         conversation_id, sender_id, body, kind, voice_path, voice_duration_ms,
+         file_path, file_name, file_mime, file_size, video_duration_ms,
+         forward_from_message_id, forward_from_sender_id
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    )
+    .run(
+      targetConversationId,
+      req.user.sub,
+      source.body ?? "",
+      source.kind || "text",
+      source.voice_path ?? null,
+      source.voice_duration_ms ?? null,
+      source.file_path ?? null,
+      source.file_name ?? null,
+      source.file_mime ?? null,
+      source.file_size ?? null,
+      source.video_duration_ms ?? null,
+      forwardFromMessageId,
+      forwardFromSenderId
+    );
+
+  const msg = selectFullMessage(info.lastInsertRowid);
+  const payload = messageToPayload(msg, targetConversationId);
+  io.to(`conv:${targetConversationId}`).emit("message", payload);
+  pushNewMessage(targetConversationId, req.user.sub, payload).catch(() => {});
+  res.status(201).json({ message: payload });
+});
+
+app.put("/api/messages/:messageId", authMiddleware, (req, res) => {
+  const messageId = Number(req.params.messageId);
+  const { body } = req.body || {};
+  const newBody = String(body || "").trim();
+  
+  if (!newBody) {
+    return res.status(400).json({ error: "Message body cannot be empty" });
+  }
+
+  const message = db
+    .prepare(
+      `SELECT m.id, m.sender_id, m.conversation_id, m.deleted_for_self, m.deleted_for_all
+       FROM messages m
+       JOIN conversation_members cm ON cm.conversation_id = m.conversation_id AND cm.user_id = ?
+       WHERE m.id = ?`
+    )
+    .get(req.user.sub, messageId);
+
+  if (!message) {
+    return res.status(404).json({ error: "Message not found" });
+  }
+
+  if (message.sender_id !== req.user.sub) {
+    return res.status(403).json({ error: "You can only edit your own messages" });
+  }
+
+  if (message.deleted_for_self || message.deleted_for_all) {
+    return res.status(400).json({ error: "Cannot edit deleted message" });
+  }
+
+  const info = db
+    .prepare(
+      `UPDATE messages 
+       SET body = ?, edited_at = datetime('now')
+       WHERE id = ?`
+    )
+    .run(newBody, messageId);
+
+  if (info.changes === 0) {
+    return res.status(500).json({ error: "Failed to update message" });
+  }
+
+  const updatedMessage = selectFullMessage(messageId);
+  const payload = messageToPayload(updatedMessage, message.conversation_id);
+  
+  io.to(`conv:${message.conversation_id}`).emit("messageUpdate", payload);
+  
+  res.json({ message: payload });
+});
+
+app.delete("/api/messages/:messageId", authMiddleware, (req, res) => {
+  const messageId = Number(req.params.messageId);
+  const { deleteForAll } = req.body || {};
+  const shouldDeleteForAll = Boolean(deleteForAll);
+
+  const message = db
+    .prepare(
+      `SELECT m.id, m.sender_id, m.conversation_id, m.deleted_for_self, m.deleted_for_all
+       FROM messages m
+       JOIN conversation_members cm ON cm.conversation_id = m.conversation_id AND cm.user_id = ?
+       WHERE m.id = ?`
+    )
+    .get(req.user.sub, messageId);
+
+  if (!message) {
+    return res.status(404).json({ error: "Message not found" });
+  }
+
+  if (message.sender_id !== req.user.sub) {
+    return res.status(403).json({ error: "You can only delete your own messages" });
+  }
+
+  if (message.deleted_for_self) {
+    return res.status(400).json({ error: "Message already deleted for you" });
+  }
+
+  let updateFields, updateValues;
+  
+  if (shouldDeleteForAll) {
+    updateFields = "deleted_for_all = datetime('now')";
+    updateValues = [messageId];
+  } else {
+    updateFields = "deleted_for_self = datetime('now')";
+    updateValues = [messageId];
+  }
+
+  const info = db
+    .prepare(
+      `UPDATE messages 
+       SET ${updateFields}
+       WHERE id = ?`
+    )
+    .run(...updateValues);
+
+  if (info.changes === 0) {
+    return res.status(500).json({ error: "Failed to delete message" });
+  }
+
+  const updatedMessage = selectFullMessage(messageId);
+  const payload = messageToPayload(updatedMessage, message.conversation_id);
+  
+  if (shouldDeleteForAll) {
+    io.to(`conv:${message.conversation_id}`).emit("messageDelete", {
+      messageId,
+      conversationId: message.conversation_id,
+      deleteForAll: true
+    });
+  } else {
+    io.to(`uid:${req.user.sub}`).emit("messageDelete", {
+      messageId,
+      conversationId: message.conversation_id,
+      deleteForAll: false
+    });
+  }
+  
+  res.json({ 
+    message: payload,
+    deleteForAll: shouldDeleteForAll
+  });
 });
 
 io.use((socket, next) => {

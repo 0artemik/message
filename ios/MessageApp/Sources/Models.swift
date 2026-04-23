@@ -9,10 +9,12 @@ struct UserDTO: Decodable, Identifiable, Sendable {
     let id: Int
     let username: String
     let displayName: String
+    let avatarUrl: String?
 
     enum CodingKeys: String, CodingKey {
         case id, username
         case displayName = "displayName"
+        case avatarUrl = "avatarUrl"
     }
 }
 

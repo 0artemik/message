@@ -1,5 +1,6 @@
 import AVFoundation
 import Combine
+import PhotosUI
 import SwiftUI
 import UniformTypeIdentifiers
 
@@ -28,9 +29,15 @@ struct ChatView: View {
     @State private var showCamera = false
     @State private var pickedVideoURL: URL?
     @State private var showFileImporter = false
+    @State private var pickedPhotoItem: PhotosPickerItem?
+    @State private var showingEditSheet = false
+    @State private var editingMessage: MessageDTO?
+    @State private var editingText = ""
+    @State private var viewedProfile: UserDTO?
 
     private var c: TelegramPalette { theme.palette }
     private var myId: Int { session.user?.id ?? -1 }
+    private var bubbleMaxWidth: CGFloat { min(UIScreen.main.bounds.width * 0.74, 320) }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -61,8 +68,9 @@ struct ChatView: View {
                     .padding(.horizontal, 12)
                     .padding(.vertical, 10)
                 }
-                .background(c.chatBg)
-                .onChange(of: messages.count) { _, _ in
+                .scrollDismissesKeyboard(.interactively)
+                .background(chatBackground)
+                .onChange(of: messages.count) { _ in
                     if let last = messages.last {
                         withAnimation { proxy.scrollTo(last.id, anchor: .bottom) }
                     }
@@ -100,14 +108,17 @@ struct ChatView: View {
             }
 
             HStack(alignment: .bottom, spacing: 8) {
-                Button {
-                    showFileImporter = true
-                } label: {
+                PhotosPicker(
+                    selection: $pickedPhotoItem,
+                    matching: .images,
+                    photoLibrary: .shared()
+                ) {
                     Image(systemName: "paperclip")
                         .font(.title3)
                         .foregroundStyle(c.textSecondary)
                         .frame(width: 40, height: 40)
                 }
+                .buttonStyle(.plain)
                 .disabled(attachBusy || isRecording)
 
                 Button {
@@ -123,7 +134,7 @@ struct ChatView: View {
                 TextField(
                     "",
                     text: $draft,
-                    prompt: Text("Сообщение").foregroundStyle(theme.isDark ? Color.white.opacity(0.7) : c.textSecondary),
+                    prompt: Text("Сообщение").foregroundColor(theme.isDark ? Color.white.opacity(0.7) : c.textSecondary),
                     axis: .vertical
                 )
                     .lineLimit(1...5)
@@ -134,7 +145,7 @@ struct ChatView: View {
                             .fill(c.inputBg)
                             .overlay(RoundedRectangle(cornerRadius: 20).stroke(c.border, lineWidth: 1))
                     )
-                    .foregroundColor(theme.isDark ? .white : c.text)
+                    .foregroundStyle(theme.isDark ? .white : c.text)
                     .tint(c.blue)
                     .disabled(isRecording)
 
@@ -170,14 +181,24 @@ struct ChatView: View {
         .toolbarColorScheme(theme.isDark ? .dark : .light, for: .navigationBar)
         .toolbar {
             ToolbarItem(placement: .principal) {
-                VStack(spacing: 1) {
-                    Text(peerName)
-                        .font(.headline)
-                        .foregroundStyle(c.text)
-                    Text(peerPresenceText())
-                        .font(.caption)
-                        .foregroundStyle(peerPresence?.online == true ? c.online : c.textSecondary)
+                Button {
+                    viewedProfile = conversation.peer
+                } label: {
+                    HStack(spacing: 10) {
+                        AvatarCircleView(user: conversation.peer, size: 34)
+                            .environmentObject(theme)
+
+                        VStack(spacing: 1) {
+                            Text(peerName)
+                                .font(.headline)
+                                .foregroundStyle(c.text)
+                            Text(peerPresenceText())
+                                .font(.caption)
+                                .foregroundStyle(peerPresence?.online == true ? c.online : c.textSecondary)
+                        }
+                    }
                 }
+                .buttonStyle(.plain)
             }
         }
         .tint(c.blue)
@@ -202,11 +223,18 @@ struct ChatView: View {
         .sheet(isPresented: $showCamera) {
             CameraVideoPicker(videoURL: $pickedVideoURL)
         }
-        .onChange(of: pickedVideoURL) { _, url in
+        .onChange(of: pickedVideoURL) { url in
             guard let url else { return }
             Task {
                 await uploadPickedVideo(url)
                 await MainActor.run { pickedVideoURL = nil }
+            }
+        }
+        .onChange(of: pickedPhotoItem) { item in
+            guard let item else { return }
+            Task {
+                await uploadPickedPhoto(item)
+                await MainActor.run { pickedPhotoItem = nil }
             }
         }
         .fileImporter(
@@ -222,50 +250,234 @@ struct ChatView: View {
                 break
             }
         }
+        .sheet(isPresented: $showingEditSheet) {
+            NavigationView {
+                VStack(spacing: 16) {
+                    TextEditor(text: $editingText)
+                        .font(.body)
+                        .padding(8)
+                        .background(c.bubbleIn)
+                        .cornerRadius(8)
+                        .padding(.horizontal)
+                    
+                    Spacer()
+                }
+                .navigationTitle("Редактирование")
+                .navigationBarTitleDisplayMode(.inline)
+                .toolbar {
+                    ToolbarItem(placement: .navigationBarLeading) {
+                        Button("Отмена") {
+                            showingEditSheet = false
+                        }
+                    }
+                    ToolbarItem(placement: .navigationBarTrailing) {
+                        Button("Сохранить") {
+                            if let messageId = editingMessage?.id, !editingText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                                Task {
+                                    await editMessage(messageId, newBody: editingText.trimmingCharacters(in: .whitespacesAndNewlines))
+                                    showingEditSheet = false
+                                }
+                            }
+                        }
+                        .disabled(editingText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    }
+                }
+            }
+            .onAppear {
+                editingText = editingMessage?.body ?? ""
+            }
+        }
+        .sheet(item: $viewedProfile) { profile in
+            UserProfileSheet(user: profile, subtitle: peerPresenceText())
+                .environmentObject(theme)
+        }
     }
 
     @ViewBuilder
     private func messageBubble(_ m: MessageDTO) -> some View {
         let mine = m.senderId == myId
         let k = m.kind ?? "text"
-        HStack {
-            if mine { Spacer(minLength: 24) }
-            VStack(alignment: mine ? .trailing : .leading, spacing: 4) {
-                Group {
-                    switch k {
-                    case "voice":
-                        VoiceMessageBubble(messageId: m.id, durationMs: m.voiceDurationMs)
-                            .environmentObject(theme)
-                    case "video_note":
-                        VideoCircleBubble(messageId: m.id)
-                            .environmentObject(theme)
-                    case "file":
-                        FileAttachmentBubble(message: m)
-                            .environmentObject(theme)
-                    default:
-                        Text(m.body)
-                            .font(.body)
-                            .foregroundStyle(c.text)
-                            .multilineTextAlignment(mine ? .trailing : .leading)
+        let canEdit = mine && k == "text"
+        let canDelete = mine
+        let isTextMessage = k == "text"
+        let isImageMessage = k == "file" && (m.fileMime ?? "").hasPrefix("image/")
+        let isVideoNoteMessage = k == "video_note"
+
+        HStack(alignment: .bottom, spacing: 0) {
+            if mine { Spacer(minLength: 52) }
+            VStack(alignment: mine ? .trailing : .leading, spacing: 2) {
+                messageBubbleContent(for: m, kind: k, mine: mine)
+                    .modifier(MessageBubbleWidthModifier(
+                        isTextMessage: isTextMessage,
+                        isImageMessage: isImageMessage,
+                        isVideoNoteMessage: isVideoNoteMessage,
+                        maxWidth: bubbleMaxWidth,
+                        alignment: mine ? .trailing : .leading
+                    ))
+                    .background(
+                        bubbleBackground(
+                            mine: mine,
+                            showsTail: isTextMessage,
+                            isVideoNoteMessage: isVideoNoteMessage
+                        )
+                    )
+                    .contextMenu {
+                        if canEdit {
+                            Button("Изменить") {
+                                showingEditSheet = true
+                                editingMessage = m
+                            }
+                        }
+                        if canDelete {
+                            Button("Удалить у себя") {
+                                Task {
+                                    await deleteMessage(m.id, deleteForAll: false)
+                                }
+                            }
+                            Button("Удалить у всех") {
+                                Task {
+                                    await deleteMessage(m.id, deleteForAll: true)
+                                }
+                            }
+                        }
                     }
-                }
-                .padding(.horizontal, 12)
-                .padding(.vertical, 8)
-                .background(
-                    RoundedRectangle(cornerRadius: 16, style: .continuous)
-                        .fill(mine ? c.bubbleOut : c.bubbleIn)
-                        .shadow(color: .black.opacity(theme.isDark ? 0.25 : 0.06), radius: 1, y: 1)
-                )
-                Text(m.createdAt)
-                    .font(.caption2)
-                    .foregroundStyle(c.textSecondary)
-                if mine {
-                    Text(m.isRead == true ? "✓✓" : "✓")
-                        .font(.caption2)
-                        .foregroundStyle(c.textSecondary)
+
+                if k != "text" {
+                    HStack(spacing: 3) {
+                        Text(formattedMessageTime(m.createdAt))
+                            .font(.caption2)
+                            .foregroundStyle(c.textSecondary)
+                        if mine {
+                            Text(m.isRead == true ? "✓✓" : "✓")
+                                .font(.caption2)
+                                .foregroundStyle(c.textSecondary)
+                        }
+                    }
+                    .padding(.horizontal, 6)
                 }
             }
-            if !mine { Spacer(minLength: 24) }
+            if !mine { Spacer(minLength: 52) }
+        }
+        .frame(maxWidth: .infinity, alignment: mine ? .trailing : .leading)
+        .padding(.vertical, 1)
+    }
+
+    @ViewBuilder
+    private func messageBubbleContent(for message: MessageDTO, kind: String, mine: Bool) -> some View {
+        switch kind {
+        case "voice":
+            VoiceMessageBubble(messageId: message.id, durationMs: message.voiceDurationMs)
+                .environmentObject(theme)
+        case "video_note":
+            VideoCircleBubble(messageId: message.id, durationMs: message.videoDurationMs)
+                .environmentObject(theme)
+        case "file":
+            FileAttachmentBubble(message: message, bubbleMaxWidth: bubbleMaxWidth)
+                .environmentObject(theme)
+        default:
+            textMessageBubble(message, mine: mine)
+        }
+    }
+
+    private func textMessageBubble(_ message: MessageDTO, mine: Bool) -> some View {
+        let body = message.body.trimmingCharacters(in: .whitespacesAndNewlines)
+        let isCompactMessage = body.count <= 24 && !body.contains("\n")
+
+        return ZStack(alignment: .bottomTrailing) {
+            Text(body.isEmpty ? " " : body)
+                .font(.system(size: 17))
+                .foregroundStyle(c.text)
+                .multilineTextAlignment(.leading)
+                .lineSpacing(1.5)
+                .modifier(TextBubbleWidthModifier(
+                    isCompactMessage: isCompactMessage,
+                    maxWidth: bubbleMaxWidth - (mine ? 62 : 52)
+                ))
+                .padding(.leading, 12)
+                .padding(.trailing, mine ? 50 : 40)
+                .padding(.top, 8)
+                .padding(.bottom, 18)
+                .fixedSize(horizontal: false, vertical: true)
+
+            HStack(spacing: 3) {
+                Text(formattedMessageTime(message.createdAt))
+                    .font(.system(size: 12))
+                    .foregroundStyle(theme.isDark ? c.textSecondary : Color.black.opacity(mine ? 0.48 : 0.42))
+                if mine {
+                    Text(message.isRead == true ? "✓✓" : "✓")
+                        .font(.system(size: 12))
+                        .foregroundStyle(message.isRead == true ? c.blue : (theme.isDark ? c.textSecondary : Color.black.opacity(0.45)))
+                }
+            }
+            .padding(.trailing, 10)
+            .padding(.bottom, 6)
+        }
+    }
+
+    private func formattedMessageTime(_ raw: String) -> String {
+        let normalized = raw.contains("T") ? raw : raw.replacingOccurrences(of: " ", with: "T")
+        let parser = ISO8601DateFormatter()
+        parser.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        let date =
+            parser.date(from: normalized)
+            ?? ISO8601DateFormatter().date(from: normalized)
+            ?? DateFormatter.chatSqlite.date(from: raw)
+
+        guard let date else { return raw }
+        return DateFormatter.chatHm.string(from: date)
+    }
+
+    private var chatBackground: some View {
+        ZStack {
+            c.chatBg
+            LinearGradient(
+                colors: [
+                    Color.white.opacity(theme.isDark ? 0.02 : 0.18),
+                    Color.clear,
+                    c.blue.opacity(theme.isDark ? 0.03 : 0.08),
+                ],
+                startPoint: .topLeading,
+                endPoint: .bottomTrailing
+            )
+            Circle()
+                .fill(c.blue.opacity(theme.isDark ? 0.04 : 0.08))
+                .frame(width: 260, height: 260)
+                .blur(radius: 8)
+                .offset(x: 140, y: -180)
+            Circle()
+                .fill(Color.white.opacity(theme.isDark ? 0.02 : 0.12))
+                .frame(width: 220, height: 220)
+                .blur(radius: 10)
+                .offset(x: -160, y: 120)
+            Circle()
+                .fill(c.online.opacity(theme.isDark ? 0.03 : 0.07))
+                .frame(width: 180, height: 180)
+                .blur(radius: 10)
+                .offset(x: 120, y: 320)
+        }
+        .ignoresSafeArea()
+    }
+
+    @ViewBuilder
+    private func bubbleBackground(mine: Bool, showsTail: Bool, isVideoNoteMessage: Bool) -> some View {
+        let fillColor = mine ? c.bubbleOut : c.bubbleIn
+
+        if isVideoNoteMessage {
+            Circle()
+                .fill(fillColor)
+                .shadow(color: .black.opacity(theme.isDark ? 0.22 : 0.08), radius: 1, y: 1)
+        } else {
+            RoundedRectangle(cornerRadius: 18, style: .continuous)
+                .fill(fillColor)
+                .shadow(color: .black.opacity(theme.isDark ? 0.22 : 0.08), radius: 1, y: 1)
+                .overlay(alignment: mine ? .bottomTrailing : .bottomLeading) {
+                    if showsTail {
+                        MessageTailShape(direction: mine ? .right : .left)
+                            .fill(fillColor)
+                            .frame(width: 12, height: 12)
+                            .offset(x: mine ? 4 : -4, y: 2)
+                    }
+                }
         }
     }
 
@@ -383,7 +595,8 @@ struct ChatView: View {
         for m in incoming {
             map["id:\(m.id)"] = m
         }
-        return map.values.sorted { $0.id < $1.id }
+        let values = Array(map.values)
+        return values.sorted { $0.id < $1.id }
     }
 
     private func startOrStopVoice() async {
@@ -519,7 +732,6 @@ struct ChatView: View {
                 mimeType: mime,
                 caption: cap
             )
-            if !cap.isEmpty { draft = "" }
             if !messages.contains(where: { $0.id == m.id }) {
                 messages.append(m)
             }
@@ -527,9 +739,69 @@ struct ChatView: View {
             errorText = (error as? LocalizedError)?.errorDescription ?? "Не удалось отправить файл"
         }
     }
+
+    private func uploadPickedPhoto(_ item: PhotosPickerItem) async {
+        attachBusy = true
+        defer { attachBusy = false }
+
+        do {
+            guard let data = try await item.loadTransferable(type: Data.self), !data.isEmpty else {
+                errorText = "Не удалось открыть фото"
+                return
+            }
+
+            let detectedType = item.supportedContentTypes.first ?? .jpeg
+            let fileExtension = detectedType.preferredFilenameExtension ?? "jpg"
+            let mimeType = detectedType.preferredMIMEType ?? "image/jpeg"
+            let fileName = "photo-\(UUID().uuidString).\(fileExtension)"
+            let destination = FileManager.default.temporaryDirectory.appendingPathComponent(fileName)
+
+            if FileManager.default.fileExists(atPath: destination.path) {
+                try FileManager.default.removeItem(at: destination)
+            }
+            try data.write(to: destination, options: .atomic)
+
+            let caption = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+            let message = try await APIClient.shared.uploadFile(
+                conversationId: conversation.id,
+                fileURL: destination,
+                originalName: fileName,
+                mimeType: mimeType,
+                caption: caption
+            )
+
+            if !messages.contains(where: { $0.id == message.id }) {
+                messages.append(message)
+            }
+            errorText = nil
+        } catch {
+            errorText = (error as? LocalizedError)?.errorDescription ?? "Не удалось отправить фото"
+        }
+    }
+
+    private func editMessage(_ messageId: Int, newBody: String) async {
+        do {
+            let updated = try await APIClient.shared.editMessage(messageId: messageId, body: newBody)
+            messages = messages.map { m in
+                if m.id == messageId { return updated }
+                return m
+            }
+        } catch {
+            errorText = (error as? LocalizedError)?.errorDescription ?? "Не удалось изменить сообщение"
+        }
+    }
+
+    private func deleteMessage(_ messageId: Int, deleteForAll: Bool) async {
+        do {
+            _ = try await APIClient.shared.deleteMessage(messageId: messageId, deleteForAll: deleteForAll)
+            messages = messages.filter { $0.id != messageId }
+        } catch {
+            errorText = (error as? LocalizedError)?.errorDescription ?? "Не удалось удалить сообщение"
+        }
+    }
 }
 
-private extension DateFormatter {
+extension DateFormatter {
     static let chatSqlite: DateFormatter = {
         let f = DateFormatter()
         f.locale = Locale(identifier: "ru_RU")
@@ -550,4 +822,73 @@ private extension DateFormatter {
         f.dateFormat = "dd.MM HH:mm"
         return f
     }()
+}
+
+private struct MessageTailShape: Shape {
+    enum Direction {
+        case left
+        case right
+    }
+
+    let direction: Direction
+
+    func path(in rect: CGRect) -> Path {
+        var path = Path()
+
+        switch direction {
+        case .left:
+            path.move(to: CGPoint(x: rect.maxX, y: rect.minY))
+            path.addQuadCurve(
+                to: CGPoint(x: rect.minX, y: rect.maxY * 0.72),
+                control: CGPoint(x: rect.minX + 2, y: rect.minY + 2)
+            )
+            path.addQuadCurve(
+                to: CGPoint(x: rect.maxX, y: rect.maxY),
+                control: CGPoint(x: rect.midX, y: rect.maxY)
+            )
+        case .right:
+            path.move(to: CGPoint(x: rect.minX, y: rect.minY))
+            path.addQuadCurve(
+                to: CGPoint(x: rect.maxX, y: rect.maxY * 0.72),
+                control: CGPoint(x: rect.maxX - 2, y: rect.minY + 2)
+            )
+            path.addQuadCurve(
+                to: CGPoint(x: rect.minX, y: rect.maxY),
+                control: CGPoint(x: rect.midX, y: rect.maxY)
+            )
+        }
+
+        path.closeSubpath()
+        return path
+    }
+}
+
+private struct MessageBubbleWidthModifier: ViewModifier {
+    let isTextMessage: Bool
+    let isImageMessage: Bool
+    let isVideoNoteMessage: Bool
+    let maxWidth: CGFloat
+    let alignment: Alignment
+
+    func body(content: Content) -> some View {
+        if isTextMessage || isImageMessage || isVideoNoteMessage {
+            content
+        } else {
+            content
+                .frame(maxWidth: maxWidth, alignment: alignment)
+        }
+    }
+}
+
+private struct TextBubbleWidthModifier: ViewModifier {
+    let isCompactMessage: Bool
+    let maxWidth: CGFloat
+
+    func body(content: Content) -> some View {
+        if isCompactMessage {
+            content.fixedSize(horizontal: true, vertical: false)
+        } else {
+            content.frame(maxWidth: maxWidth, alignment: .leading)
+        }
+    }
 }

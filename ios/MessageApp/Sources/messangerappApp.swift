@@ -6,12 +6,3 @@
 //
 
 import SwiftUI
-
-@main
-struct messangerappApp: App {
-    var body: some Scene {
-        WindowGroup {
-            ContentView()
-        }
-    }
-}

@@ -1,29 +1,32 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { io } from "socket.io-client";
 import { Link } from "react-router-dom";
-import { api, uploadFileAttachment, uploadVoice } from "../api.js";
+import { api, uploadFileAttachment, uploadVoice, editMessage, deleteMessage, forwardMessage } from "../api.js";
 import { useAuth } from "../authContext.jsx";
 import { FileAttachmentMessage, VideoCircleMessage } from "../ChatMedia.jsx";
 import { compressAttachmentForUpload } from "../mediaCompression.js";
 import { formatPresenceLabel } from "../presenceUtils.js";
 import SettingsModal from "../SettingsModal.jsx";
+import ProfileModal from "../ProfileModal.jsx";
 import VideoNoteModal from "../VideoNoteModal.jsx";
 import VoiceMessage from "../VoiceMessage.jsx";
 import VoiceWaveform from "../VoiceWaveform.jsx";
+import MessageBubble from "../MessageBubble.jsx";
+import UserAvatar from "../UserAvatar.jsx";
 import "./Chat.css";
-
-function initials(name) {
-  const parts = String(name || "").trim().split(/\s+/);
-  const a = parts[0]?.[0] || "?";
-  const b = parts[1]?.[0] || "";
-  return (a + b).toUpperCase();
-}
 
 function formatTime(iso) {
   if (!iso) return "";
-  const d = new Date(String(iso).includes("T") ? iso : iso.replace(" ", "T"));
+  const raw = String(iso);
+  const normalized =
+    /[zZ]$|[+\-]\d{2}:\d{2}$/.test(raw) ? raw : `${raw.includes("T") ? raw : raw.replace(" ", "T")}Z`;
+  const d = new Date(normalized);
   if (Number.isNaN(d.getTime())) return "";
-  return d.toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" });
+  return d.toLocaleTimeString("ru-RU", {
+    hour: "2-digit",
+    minute: "2-digit",
+    timeZone: "Europe/Moscow",
+  });
 }
 
 function formatRecordClock(totalSec) {
@@ -42,6 +45,19 @@ function previewLastMessage(lastMessage, myId) {
   return `${prefix}${lastMessage.body || ""}`;
 }
 
+function previewMessageSnippet(message) {
+  if (!message) return "";
+  if (message.kind === "voice") return "Голосовое сообщение";
+  if (message.kind === "video_note") return "Видеосообщение";
+  if (message.kind === "file") return `📎 ${message.fileName || "Файл"}`;
+  return message.body || "";
+}
+
+function displayNameForMessage(message, currentUser) {
+  if (!message) return "";
+  return Number(message.senderId) === Number(currentUser?.id) ? "Вы" : message.senderName || "Собеседник";
+}
+
 export default function Chat() {
   const { user, logout, token } = useAuth();
   const [query, setQuery] = useState("");
@@ -56,6 +72,7 @@ export default function Chat() {
   const [draft, setDraft] = useState("");
   const [menuOpen, setMenuOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [profileState, setProfileState] = useState(null);
   const [videoOpen, setVideoOpen] = useState(false);
   const [presence, setPresence] = useState({});
   const [recording, setRecording] = useState(false);
@@ -64,6 +81,11 @@ export default function Chat() {
   const [voiceError, setVoiceError] = useState("");
   const [attachBusy, setAttachBusy] = useState(false);
   const [uploadPreview, setUploadPreview] = useState(null);
+  const [replyToMessage, setReplyToMessage] = useState(null);
+  const [forwardingMessage, setForwardingMessage] = useState(null);
+  const [forwardQuery, setForwardQuery] = useState("");
+  const [forwardSearchHits, setForwardSearchHits] = useState([]);
+  const [forwardBusy, setForwardBusy] = useState(false);
   const messagesEnd = useRef(null);
   const socketRef = useRef(null);
   const joinedConvRef = useRef(null);
@@ -132,6 +154,14 @@ export default function Chat() {
   useEffect(() => {
     loadConversations().catch(() => {});
   }, [loadConversations]);
+
+  useEffect(() => {
+    if (!activeId) return;
+    const currentConversation = conversations.find((c) => Number(c.id) === Number(activeId));
+    if (currentConversation?.peer) {
+      setActivePeer(currentConversation.peer);
+    }
+  }, [activeId, conversations]);
 
   useEffect(() => {
     const ids = conversations.map((c) => c.peer?.id).filter(Boolean);
@@ -212,6 +242,16 @@ export default function Chat() {
         [p.userId]: { online: p.online, lastSeenAt: p.lastSeenAt },
       }));
     });
+    socket.on("messageUpdate", (payload) => {
+      if (Number(payload.conversationId) !== Number(activeIdRef.current)) return;
+      setMessages((prev) =>
+        prev.map((m) => (Number(m.id) === Number(payload.id) ? { ...m, ...payload } : m))
+      );
+    });
+    socket.on("messageDelete", ({ messageId, conversationId, deleteForAll }) => {
+      if (Number(conversationId) !== Number(activeIdRef.current)) return;
+      setMessages((prev) => prev.filter((m) => Number(m.id) !== Number(messageId)));
+    });
     return () => {
       socket.disconnect();
       socketRef.current = null;
@@ -231,6 +271,20 @@ export default function Chat() {
     }, 250);
     return () => clearTimeout(t);
   }, [query]);
+
+  useEffect(() => {
+    const q = forwardQuery.trim();
+    if (!forwardingMessage || q.length < 2) {
+      setForwardSearchHits([]);
+      return undefined;
+    }
+    const t = setTimeout(() => {
+      api(`/users/search?q=${encodeURIComponent(q)}`)
+        .then((d) => setForwardSearchHits(d.users || []))
+        .catch(() => setForwardSearchHits([]));
+    }, 250);
+    return () => clearTimeout(t);
+  }, [forwardQuery, forwardingMessage]);
 
   useEffect(() => {
     activeIdRef.current = activeId;
@@ -280,6 +334,7 @@ export default function Chat() {
   async function openWithUser(peer) {
     setQuery("");
     setSearchHits([]);
+    setReplyToMessage(null);
     const data = await api("/conversations/direct", {
       method: "POST",
       body: { userId: peer.id },
@@ -310,6 +365,7 @@ export default function Chat() {
   }
 
   async function selectConversation(c) {
+    setReplyToMessage(null);
     setActiveId(c.id);
     setActivePeer(c.peer);
     const msgData = await api(`/conversations/${c.id}/messages?limit=50`);
@@ -348,7 +404,11 @@ export default function Chat() {
     try {
       const data = await api(`/conversations/${item.conversationId}/messages`, {
         method: "POST",
-        body: { body: item.text, clientMsgId: item.clientMsgId },
+        body: {
+          body: item.text,
+          clientMsgId: item.clientMsgId,
+          replyToMessageId: item.replyToMessageId,
+        },
       });
       const msg = data.message;
       pendingQueueRef.current = pendingQueueRef.current.filter((x) => x.clientMsgId !== item.clientMsgId);
@@ -366,7 +426,18 @@ export default function Chat() {
   async function sendMessage() {
     const text = draft.trim();
     if (!text || !activeId) return;
+    const replyPreview = replyToMessage
+      ? {
+          id: replyToMessage.id,
+          senderId: replyToMessage.senderId,
+          senderName: displayNameForMessage(replyToMessage, user),
+          body: previewMessageSnippet(replyToMessage),
+          kind: replyToMessage.kind,
+          fileName: replyToMessage.fileName ?? null,
+        }
+      : null;
     setDraft("");
+    setReplyToMessage(null);
     const clientMsgId = `c-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     const local = {
       id: `local-${clientMsgId}`,
@@ -377,6 +448,7 @@ export default function Chat() {
       pending: true,
       isRead: false,
       clientMsgId,
+      replyTo: replyPreview,
     };
     setMessages((prev) => [...prev, local]);
     shouldStickToBottomRef.current = true;
@@ -384,6 +456,7 @@ export default function Chat() {
       conversationId: activeId,
       text,
       clientMsgId,
+      replyToMessageId: replyToMessage?.id ?? null,
       attempts: 0,
       nextTryAt: Date.now(),
     });
@@ -395,6 +468,43 @@ export default function Chat() {
       e.preventDefault();
       sendMessage();
     }
+  }
+
+  async function handleEditMessage(messageId, newBody) {
+    try {
+      const response = await editMessage(messageId, newBody);
+      setMessages((prev) =>
+        prev.map((m) => (Number(m.id) === Number(messageId) ? { ...m, ...response.message } : m))
+      );
+    } catch (error) {
+      console.error("Failed to edit message:", error);
+    }
+  }
+
+  async function handleDeleteMessage(messageId, deleteForAll = false) {
+    try {
+      await deleteMessage(messageId, deleteForAll);
+      setMessages((prev) => prev.filter((m) => Number(m.id) !== Number(messageId)));
+    } catch (error) {
+      console.error("Failed to delete message:", error);
+    }
+  }
+
+  function handleReplyMessage(message) {
+    setReplyToMessage(message);
+  }
+
+  function handleForwardStart(message) {
+    setForwardingMessage(message);
+    setForwardQuery("");
+    setForwardSearchHits([]);
+  }
+
+  function closeForwardDialog() {
+    setForwardingMessage(null);
+    setForwardQuery("");
+    setForwardSearchHits([]);
+    setForwardBusy(false);
   }
 
   function stopMedia() {
@@ -481,7 +591,10 @@ export default function Chat() {
       return;
     }
     try {
-      const data = await uploadVoice(activeId, blob, durationMs);
+      const data = await uploadVoice(activeId, blob, durationMs, {
+        replyToMessageId: replyToMessage?.id ?? null,
+      });
+      setReplyToMessage(null);
       const msg = data.message;
       setMessages((prev) => (prev.some((m) => m.id === msg.id) ? prev : [...prev, msg]));
       await loadConversations();
@@ -517,10 +630,17 @@ export default function Chat() {
         progress: 0,
         compressed: compressed.compressed,
       });
-      const data = await uploadFileAttachment(activeId, fileToUpload, cap, (p) => {
-        setUploadPreview((prev) => (prev ? { ...prev, progress: p } : prev));
-      });
+      const data = await uploadFileAttachment(
+        activeId,
+        fileToUpload,
+        cap,
+        (p) => {
+          setUploadPreview((prev) => (prev ? { ...prev, progress: p } : prev));
+        },
+        { replyToMessageId: replyToMessage?.id ?? null }
+      );
       if (cap) setDraft("");
+      setReplyToMessage(null);
       const msg = data.message;
       setMessages((prev) => (prev.some((m) => m.id === msg.id) ? prev : [...prev, msg]));
       await loadConversations();
@@ -547,6 +667,37 @@ export default function Chat() {
     if (!file) return;
     e.preventDefault();
     await handleAttachmentUpload(file);
+  }
+
+  async function performForward(targetConversationId) {
+    if (!forwardingMessage?.id || !targetConversationId) return;
+    setForwardBusy(true);
+    setVoiceError("");
+    try {
+      await forwardMessage(forwardingMessage.id, targetConversationId);
+      await loadConversations();
+      closeForwardDialog();
+    } catch (error) {
+      setVoiceError(error.message || "Не удалось переслать сообщение");
+      setForwardBusy(false);
+    }
+  }
+
+  async function forwardToUser(peer) {
+    setForwardBusy(true);
+    setVoiceError("");
+    try {
+      const data = await api("/conversations/direct", {
+        method: "POST",
+        body: { userId: peer.id },
+      });
+      await forwardMessage(forwardingMessage.id, data.conversation.id);
+      await loadConversations();
+      closeForwardDialog();
+    } catch (error) {
+      setVoiceError(error.message || "Не удалось переслать сообщение");
+      setForwardBusy(false);
+    }
   }
 
   useEffect(() => {
@@ -577,6 +728,28 @@ export default function Chat() {
         lastSeenAt: peerStatus?.lastSeenAt,
       })
     : "";
+
+  function openOwnProfile() {
+    if (!user) return;
+    setProfileState({
+      profile: user,
+      editable: true,
+      statusText: "Это ваш профиль",
+    });
+  }
+
+  function openPeerProfile() {
+    if (!activePeer) return;
+    setProfileState({
+      profile: activePeer,
+      editable: false,
+      statusText: statusLine,
+    });
+  }
+
+  function handleProfileUpdated(nextUser) {
+    setProfileState((prev) => (prev ? { ...prev, profile: nextUser } : prev));
+  }
 
   function renderMessageBody(m) {
     if (m.kind === "voice") {
@@ -622,11 +795,29 @@ export default function Chat() {
   return (
     <div className="chat-shell">
       <SettingsModal open={settingsOpen} onClose={() => setSettingsOpen(false)} />
+      <ProfileModal
+        open={Boolean(profileState)}
+        profile={profileState?.profile ?? null}
+        editable={Boolean(profileState?.editable)}
+        statusText={profileState?.statusText || ""}
+        onClose={() => setProfileState(null)}
+        onUpdated={handleProfileUpdated}
+        onOpenSettings={
+          profileState?.editable
+            ? () => {
+                setProfileState(null);
+                setSettingsOpen(true);
+              }
+            : undefined
+        }
+      />
       <VideoNoteModal
         open={videoOpen}
         conversationId={activeId}
+        replyToMessageId={replyToMessage?.id ?? null}
         onClose={() => setVideoOpen(false)}
         onSent={async () => {
+          setReplyToMessage(null);
           await loadConversations();
           const cid = activeIdRef.current;
           if (cid) {
@@ -639,6 +830,75 @@ export default function Chat() {
           }
         }}
       />
+      {forwardingMessage ? (
+        <div className="forward-dialog-overlay" onClick={closeForwardDialog}>
+          <div className="forward-dialog" onClick={(e) => e.stopPropagation()}>
+            <div className="forward-dialog-header">
+              <div>
+                <div className="forward-dialog-title">Переслать сообщение</div>
+                <div className="forward-dialog-subtitle">{previewMessageSnippet(forwardingMessage)}</div>
+              </div>
+              <button type="button" className="forward-dialog-close" onClick={closeForwardDialog}>
+                ×
+              </button>
+            </div>
+            <input
+              className="forward-search-input"
+              placeholder="Найти пользователя…"
+              value={forwardQuery}
+              onChange={(e) => setForwardQuery(e.target.value)}
+            />
+            {forwardQuery.trim().length >= 2 ? (
+              <div className="forward-section">
+                <div className="forward-section-title">Пользователи</div>
+                {forwardSearchHits.length === 0 ? (
+                  <div className="forward-empty">Никого не нашли</div>
+                ) : (
+                  forwardSearchHits.map((peer) => (
+                    <button
+                      key={`user-${peer.id}`}
+                      type="button"
+                      className="forward-target-item"
+                      disabled={forwardBusy}
+                      onClick={() => {
+                        forwardToUser(peer).catch(() => {});
+                      }}
+                    >
+                      <UserAvatar user={peer} className="chat-avatar forward-avatar" imgClassName="chat-avatar forward-avatar avatar-image" />
+                      <div className="forward-target-meta">
+                        <div className="forward-target-name">{peer.displayName}</div>
+                        <div className="forward-target-sub">@{peer.username}</div>
+                      </div>
+                    </button>
+                  ))
+                )}
+              </div>
+            ) : null}
+            <div className="forward-section">
+              <div className="forward-section-title">Ваши чаты</div>
+              <div className="forward-target-list">
+                {conversations.map((conv) => (
+                  <button
+                    key={`conv-${conv.id}`}
+                    type="button"
+                    className="forward-target-item"
+                    disabled={forwardBusy}
+                    onClick={() => {
+                      performForward(conv.id).catch(() => {});
+                    }}
+                  >
+                    <UserAvatar user={conv.peer} className="chat-avatar forward-avatar" imgClassName="chat-avatar forward-avatar avatar-image" />
+                    <div className="forward-target-meta">
+                      <div className="forward-target-name">{conv.peer?.displayName}</div>
+                      <div className="forward-target-sub">{previewLastMessage(conv.lastMessage, user?.id)}</div>
+                    </div>
+                  </button>
+                ))}
+              </div>
+            </div>
+          </div>
+        </div>
+      ) : null}
       <aside className="chat-sidebar">
         <header className="chat-sidebar-header">
           <button
@@ -656,16 +916,20 @@ export default function Chat() {
           {menuOpen ? (
             <div className="chat-menu-popover" onClick={(e) => e.stopPropagation()}>
               <div className="chat-menu-panel">
-                <div style={{ padding: "8px 12px", fontSize: 14, fontWeight: 500 }}>{user?.displayName}</div>
-                <div
-                  style={{
-                    padding: "0 12px 8px",
-                    fontSize: 12,
-                    color: "var(--tg-text-secondary)",
+                <button
+                  type="button"
+                  className="chat-menu-profile"
+                  onClick={() => {
+                    setMenuOpen(false);
+                    openOwnProfile();
                   }}
                 >
-                  @{user?.username}
-                </div>
+                  <UserAvatar user={user} className="chat-avatar chat-menu-profile-avatar" imgClassName="chat-avatar chat-menu-profile-avatar avatar-image" />
+                  <div className="chat-menu-profile-meta">
+                    <div className="chat-menu-profile-name">{user?.displayName}</div>
+                    <div className="chat-menu-profile-username">@{user?.username}</div>
+                  </div>
+                </button>
                 <button
                   type="button"
                   className="chat-menu-item"
@@ -721,7 +985,7 @@ export default function Chat() {
                     onClick={() => openWithUser(u)}
                   >
                     <div style={{ position: "relative" }}>
-                      <div className="chat-avatar">{initials(u.displayName)}</div>
+                      <UserAvatar user={u} className="chat-avatar" imgClassName="chat-avatar avatar-image" />
                       {pr?.online ? (
                         <span
                           className="chat-online-dot"
@@ -759,7 +1023,7 @@ export default function Chat() {
                 onClick={() => selectConversation(c)}
               >
                 <div style={{ position: "relative" }}>
-                  <div className="chat-avatar">{initials(c.peer?.displayName)}</div>
+                  <UserAvatar user={c.peer} className="chat-avatar" imgClassName="chat-avatar avatar-image" />
                   {pr?.online ? (
                     <span
                       className="chat-online-dot"
@@ -792,22 +1056,27 @@ export default function Chat() {
         ) : (
           <>
             <header className="chat-main-header">
-              <div className="chat-avatar" style={{ width: 40, height: 40, fontSize: 15 }}>
-                {initials(activePeer?.displayName)}
-              </div>
-              <div style={{ flex: 1, minWidth: 0 }}>
-                <div className="chat-main-header-name">{activePeer?.displayName}</div>
-                <div className="chat-main-header-sub chat-peer-row">
-                  {peerStatus?.online ? (
-                    <>
-                      <span className="chat-online-dot" style={{ width: 8, height: 8 }} />
+              <button type="button" className="chat-profile-trigger" onClick={openPeerProfile}>
+                <UserAvatar
+                  user={activePeer}
+                  className="chat-avatar"
+                  imgClassName="chat-avatar avatar-image"
+                  style={{ width: 40, height: 40, fontSize: 15 }}
+                />
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div className="chat-main-header-name">{activePeer?.displayName}</div>
+                  <div className="chat-main-header-sub chat-peer-row">
+                    {peerStatus?.online ? (
+                      <>
+                        <span className="chat-online-dot" style={{ width: 8, height: 8 }} />
+                        <span>{statusLine}</span>
+                      </>
+                    ) : (
                       <span>{statusLine}</span>
-                    </>
-                  ) : (
-                    <span>{statusLine}</span>
-                  )}
+                    )}
+                  </div>
                 </div>
-              </div>
+              </button>
             </header>
             <div
               className="chat-messages"
@@ -829,20 +1098,28 @@ export default function Chat() {
                 const out = m.senderId === user?.id;
                 const isImageFile = m.kind === "file" && String(m.fileMime || "").startsWith("image/");
                 const isVoice = m.kind === "voice";
+                const messageContent = renderMessageBody(m);
+                const showTime = !isVoice;
+                const timeContent = showTime ? formatTime(m.createdAt) : null;
+                const statusContent = showTime ? statusMark(m) : null;
+                
                 return (
-                  <div key={m.id} className={`chat-bubble-row${out ? " out" : ""}`}>
-                    <div
-                      className={`chat-bubble${out ? " out" : " in"}${m.kind !== "text" ? " bubble-media" : ""}${isImageFile ? " media-image" : ""}${isVoice ? " media-voice" : ""}`}
-                    >
-                      {renderMessageBody(m)}
-                      {!isVoice ? (
-                        <span className="chat-bubble-time">
-                          {formatTime(m.createdAt)} {statusMark(m)}
-                        </span>
-                      ) : null}
-                      {isVoice ? <span className="chat-bubble-time voice-time">{formatTime(m.createdAt)}</span> : null}
+                  <MessageBubble
+                    key={m.id}
+                    message={m}
+                    isOwn={out}
+                    onEdit={handleEditMessage}
+                    onDelete={handleDeleteMessage}
+                    onReply={handleReplyMessage}
+                    onForward={handleForwardStart}
+                    time={timeContent}
+                    statusMark={statusContent}
+                  >
+                    <div className={isImageFile ? "media-image" : isVoice ? "media-voice" : ""}>
+                      {messageContent}
+                      {isVoice && <span className="chat-bubble-time voice-time">{formatTime(m.createdAt)}</span>}
                     </div>
-                  </div>
+                  </MessageBubble>
                 );
               })}
               <div ref={messagesEnd} />
@@ -890,6 +1167,23 @@ export default function Chat() {
                   </div>
                   {uploadPreview.compressed ? <div className="upload-compressed-note">Сжато перед отправкой</div> : null}
                 </div>
+              </div>
+            ) : null}
+            {replyToMessage ? (
+              <div className="reply-strip">
+                <div className="reply-strip-accent" />
+                <div className="reply-strip-body">
+                  <div className="reply-strip-title">{displayNameForMessage(replyToMessage, user)}</div>
+                  <div className="reply-strip-text">{previewMessageSnippet(replyToMessage)}</div>
+                </div>
+                <button
+                  type="button"
+                  className="reply-strip-close"
+                  aria-label="Отменить ответ"
+                  onClick={() => setReplyToMessage(null)}
+                >
+                  ×
+                </button>
               </div>
             ) : null}
             <div className="chat-compose">

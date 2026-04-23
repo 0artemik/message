@@ -16,6 +16,7 @@ db.exec(`
     email TEXT NOT NULL UNIQUE COLLATE NOCASE,
     password_hash TEXT NOT NULL,
     display_name TEXT NOT NULL,
+    avatar_path TEXT,
     last_seen_at TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
   );
@@ -46,6 +47,12 @@ db.exec(`
     file_size INTEGER,
     video_duration_ms INTEGER,
     client_msg_id TEXT,
+    reply_to_message_id INTEGER REFERENCES messages(id) ON DELETE SET NULL,
+    forward_from_message_id INTEGER REFERENCES messages(id) ON DELETE SET NULL,
+    forward_from_sender_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    edited_at TEXT,
+    deleted_for_self TEXT,
+    deleted_for_all TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
   );
 
@@ -85,6 +92,13 @@ function migrate() {
       /* ignore */
     }
   }
+  if (!ucols.includes("avatar_path")) {
+    try {
+      db.exec("ALTER TABLE users ADD COLUMN avatar_path TEXT");
+    } catch {
+      /* ignore */
+    }
+  }
   const msgMigrations = [
     ["kind", "ALTER TABLE messages ADD COLUMN kind TEXT DEFAULT 'text'"],
     ["voice_path", "ALTER TABLE messages ADD COLUMN voice_path TEXT"],
@@ -95,6 +109,12 @@ function migrate() {
     ["file_size", "ALTER TABLE messages ADD COLUMN file_size INTEGER"],
     ["video_duration_ms", "ALTER TABLE messages ADD COLUMN video_duration_ms INTEGER"],
     ["client_msg_id", "ALTER TABLE messages ADD COLUMN client_msg_id TEXT"],
+    ["reply_to_message_id", "ALTER TABLE messages ADD COLUMN reply_to_message_id INTEGER REFERENCES messages(id) ON DELETE SET NULL"],
+    ["forward_from_message_id", "ALTER TABLE messages ADD COLUMN forward_from_message_id INTEGER REFERENCES messages(id) ON DELETE SET NULL"],
+    ["forward_from_sender_id", "ALTER TABLE messages ADD COLUMN forward_from_sender_id INTEGER REFERENCES users(id) ON DELETE SET NULL"],
+    ["edited_at", "ALTER TABLE messages ADD COLUMN edited_at TEXT"],
+    ["deleted_for_self", "ALTER TABLE messages ADD COLUMN deleted_for_self TEXT"],
+    ["deleted_for_all", "ALTER TABLE messages ADD COLUMN deleted_for_all TEXT"],
   ];
   for (const [col, sql] of msgMigrations) {
     const mcols = db.prepare("PRAGMA table_info(messages)").all().map((c) => c.name);
